@@ -249,11 +249,11 @@ rewards:
     reward:
       rm_enabled: true
       rm_transition: 0.001
-      rm_cut_success: 5.0
-      rm_surf_success: 3.0
+      rm_cut_success: 4.0
+      rm_surf_success: 1.0
       rm_flash_success: 5.0
       rm_pokeflute_success: 5.0
-      step_penalty: 0.001
+      step_penalty: 0.0005
 
 
 # Policies to use for training.

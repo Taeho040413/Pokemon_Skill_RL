@@ -129,11 +129,6 @@ class BaselineRewardEnv(RedGymEnv):
 
         return self.rm_reward_total
 
-    def get_step_penalty_reward(self) -> float:
-        """Apply a constant negative reward each step."""
-        penalty = float(self.reward_config.get("step_penalty", 0.0))
-        return -abs(penalty)
-
     def ensure_cut_for_reward_machine(self) -> None:
         if self.reward_machine.state != RewardMachineState.CUT_DETECTED:
             return

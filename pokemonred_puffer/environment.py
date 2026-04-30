@@ -422,12 +422,8 @@ class RedGymEnv(Env):
 
         self.max_map_progress = 0
         self.progress_reward = self.get_game_state_reward()
-        # `get_game_state_reward()` may optionally return a per-step constant penalty.
-        # We must not include it into `self.total_reward`, otherwise it cancels out in
-        # `new_step = (new_total - old_total)` and will not affect PPO.
-        self.total_reward = sum(
-            val for k, val in self.progress_reward.items() if k != "step_penalty"
-        )
+        # update_reward()와 동일: 누적 보상 dict 전체 합을 기준점으로 둔다.
+        self.total_reward = sum(self.progress_reward.values())
 
         self.first = False
 
