@@ -164,6 +164,7 @@ cython_debug/
 
 # Emulator files
 *.gb
+!train_skill_red.gb
 # local session files
 session_*
 experiments
