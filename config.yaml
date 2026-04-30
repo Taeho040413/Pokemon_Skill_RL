@@ -253,7 +253,7 @@ rewards:
       rm_surf_success: 1.0
       rm_flash_success: 5.0
       rm_pokeflute_success: 5.0
-      step_penalty: 0.0005
+      step_penalty: 0.0003
 
 
 # Policies to use for training.

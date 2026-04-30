@@ -206,22 +206,6 @@ REWARD_MACHINE_TRANSITIONS: tuple[RewardMachineTransition, ...] = (
         "rm_cut_detected",
         lambda ctx: ctx.tile_in_front in CUTTABLE_TILES and ctx.can_use_cut,
     ),
-    # Skip 전이: RM이 DETECTED / MENU_OPEN 상태에서도 실제 컷이 발생하면 바로 SUCCESS로.
-    # per-cycle count 가드는 _next_transition에서 처리한다(abort보다 반드시 먼저 검사).
-    RewardMachineTransition(
-        RewardMachineState.CUT_DETECTED,
-        RewardMachineState.CUT_SUCCESS,
-        "rm_cut_success",
-        lambda ctx: ctx.used_cut_successfully and ctx.can_use_cut
-        and ctx.tile_in_front not in CUTTABLE_TILES,
-    ),
-    RewardMachineTransition(
-        RewardMachineState.CUT_MENU_OPEN,
-        RewardMachineState.CUT_SUCCESS,
-        "rm_cut_success",
-        lambda ctx: ctx.used_cut_successfully and ctx.can_use_cut
-        and ctx.tile_in_front not in CUTTABLE_TILES,
-    ),
     # 정상 순서 전이
     RewardMachineTransition(
         RewardMachineState.CUT_DETECTED,
@@ -255,7 +239,7 @@ REWARD_MACHINE_TRANSITIONS: tuple[RewardMachineTransition, ...] = (
         "rm_cut_done",
         lambda ctx: True,
     ),
-    # Abort: skip보다 뒤에 두어야 "컷 성공 + 타일 변경" 시 SUCCESS가 abort보다 먼저 발화한다.
+    # Abort
     RewardMachineTransition(
         RewardMachineState.CUT_DETECTED,
         RewardMachineState.IDLE,
@@ -272,27 +256,6 @@ REWARD_MACHINE_TRANSITIONS: tuple[RewardMachineTransition, ...] = (
             ctx.tile_in_front == SURF_TILE_IN_FRONT
             and ctx.can_use_surf
             and not ctx.is_surfing
-        ),
-    ),
-    # Skip 전이: 서핑이 시작됐으면 어느 중간 상태에서든 즉시 SUCCESS로.
-    RewardMachineTransition(
-        RewardMachineState.SURF_DETECTED,
-        RewardMachineState.SURF_SUCCESS,
-        "rm_surf_success",
-        lambda ctx: (
-            ctx.can_use_surf
-            and ctx.is_surfing
-            and ctx.tile_in_front != SURF_TILE_IN_FRONT
-        ),
-    ),
-    RewardMachineTransition(
-        RewardMachineState.SURF_MENU_OPEN,
-        RewardMachineState.SURF_SUCCESS,
-        "rm_surf_success",
-        lambda ctx: (
-            ctx.can_use_surf
-            and ctx.is_surfing
-            and ctx.tile_in_front != SURF_TILE_IN_FRONT
         ),
     ),
     # 정상 순서 전이
@@ -328,7 +291,7 @@ REWARD_MACHINE_TRANSITIONS: tuple[RewardMachineTransition, ...] = (
         "rm_surf_done",
         lambda ctx: True,
     ),
-    # Abort: skip보다 뒤에 위치.
+    # Abort
     RewardMachineTransition(
         RewardMachineState.SURF_DETECTED,
         RewardMachineState.IDLE,
@@ -342,17 +305,6 @@ REWARD_MACHINE_TRANSITIONS: tuple[RewardMachineTransition, ...] = (
         RewardMachineState.POKEFLUTE_DETECTED,
         "rm_pokeflute_detected",
         lambda ctx: ctx.tile_in_front == POKEFLUTE_TILE_IN_FRONT and ctx.can_use_pokeflute,
-    ),
-    # Skip 전이: BAG_OPEN을 거치지 않아도 실제 플루트 사용이 감지되면 바로 SUCCESS로.
-    RewardMachineTransition(
-        RewardMachineState.POKEFLUTE_DETECTED,
-        RewardMachineState.POKEFLUTE_SUCCESS,
-        "rm_pokeflute_success",
-        lambda ctx: (
-            ctx.used_pokeflute_successfully
-            and ctx.can_use_pokeflute
-            and ctx.tile_in_front != POKEFLUTE_TILE_IN_FRONT
-        ),
     ),
     # 정상 순서 전이
     RewardMachineTransition(
@@ -379,7 +331,7 @@ REWARD_MACHINE_TRANSITIONS: tuple[RewardMachineTransition, ...] = (
         "rm_pokeflute_done",
         lambda ctx: True,
     ),
-    # Abort: skip보다 뒤에 위치.
+    # Abort
     RewardMachineTransition(
         RewardMachineState.POKEFLUTE_DETECTED,
         RewardMachineState.IDLE,
@@ -634,8 +586,7 @@ class RewardMachine:
                     and not self._idle_pokeflute_entry_ok
                 ):
                     continue
-            # → CUT_SUCCESS: 어느 상태에서든 이 사이클에서 실제 새 컷이 있어야 함.
-            # skip 전이(DETECTED/MENU_OPEN→SUCCESS)도 포함해 동일 가드 적용.
+            # → CUT_SUCCESS: 이 사이클에서 실제 새 컷이 있어야 함.
             if (
                 transition.target == RewardMachineState.CUT_SUCCESS
                 and context.valid_cut_coords_count <= self._cut_cycle_start_count
@@ -649,7 +600,6 @@ class RewardMachine:
             ):
                 continue
             # → POKEFLUTE_SUCCESS: 이 사이클에서 실제로 새 flute 사용이 있어야 함.
-            # skip 전이(DETECTED→SUCCESS)도 포함.
             if (
                 transition.target == RewardMachineState.POKEFLUTE_SUCCESS
                 and context.valid_pokeflute_coords_count <= self._pokeflute_cycle_start_count
