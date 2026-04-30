@@ -167,6 +167,5 @@ cython_debug/
 # local session files
 session_*
 experiments
-runs
 video
 wandb
