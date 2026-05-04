@@ -209,7 +209,6 @@ class MultiConvolutionalPolicy(nn.Module):
                 ).reshape(restored_global_map_shape)
         # badges = self.badge_buffer <= observations["badges"]
         map_id = self.map_embeddings(observations["map_id"].int()).squeeze(1)
-        blackout_map_id = self.map_embeddings(observations["blackout_map_id"].int()).squeeze(1)
         # The bag quantity can be a value between 1 and 99
         # TODO: Should items be positionally encoded? I dont think it matters
         items = (
@@ -248,10 +247,6 @@ class MultiConvolutionalPolicy(nn.Module):
                 type2,
                 observations["level"].float().unsqueeze(-1) / 100.0,
                 observations["maxHP"].float().unsqueeze(-1) / 714.0,
-                observations["attack"].float().unsqueeze(-1) / 714.0,
-                observations["defense"].float().unsqueeze(-1) / 714.0,
-                observations["speed"].float().unsqueeze(-1) / 714.0,
-                observations["special"].float().unsqueeze(-1) / 714.0,
                 moves,
             ),
             dim=-1,
@@ -281,18 +276,26 @@ class MultiConvolutionalPolicy(nn.Module):
             (
                 screen_latent,
                 one_hot(observations["direction"].int(), 4).float().squeeze(1),
-                one_hot(observations["battle_type"].int(), 4).float().squeeze(1),
                 map_id.squeeze(1),
-                blackout_map_id.squeeze(1),
                 items.flatten(start_dim=1),
                 party_latent,
                 events_obs,
-                observations["rival_3"].float(),
                 observations["game_corner_rocket"].float(),
                 observations["saffron_guard"].float(),
                 observations["lapras"].float(),
+                (observations["tile_in_front"].float() / 255.0).reshape(
+                    observations["tile_in_front"].shape[0], -1
+                ),
             )
-            + (() if self.skip_safari_zone else (observations["safari_steps"].float() / 502.0,))
+            + (
+                ()
+                if self.skip_safari_zone
+                else (
+                    (observations["safari_steps"].float() / 502.0).reshape(
+                        observations["safari_steps"].shape[0], -1
+                    ),
+                )
+            )
             + (
                 (self.global_map_network(global_map.float() / 255.0).squeeze(1),)
                 if self.use_global_map
@@ -314,19 +317,27 @@ class MultiConvolutionalPolicy(nn.Module):
             (
                 screen_latent,
                 one_hot(observations["direction"].int(), 4).float().squeeze(1),
-                one_hot(observations["battle_type"].int(), 4).float().squeeze(1),
                 map_id.squeeze(1),
-                blackout_map_id.squeeze(1),
                 items.flatten(start_dim=1),
                 party_latent,
                 events_obs,
                 rm_state,
-                observations["rival_3"].float(),
                 observations["game_corner_rocket"].float(),
                 observations["saffron_guard"].float(),
                 observations["lapras"].float(),
+                (observations["tile_in_front"].float() / 255.0).reshape(
+                    observations["tile_in_front"].shape[0], -1
+                ),
             )
-            + (() if self.skip_safari_zone else (observations["safari_steps"].float() / 502.0,))
+            + (
+                ()
+                if self.skip_safari_zone
+                else (
+                    (observations["safari_steps"].float() / 502.0).reshape(
+                        observations["safari_steps"].shape[0], -1
+                    ),
+                )
+            )
             + (
                 (self.global_map_network(global_map.float() / 255.0).squeeze(1),)
                 if self.use_global_map

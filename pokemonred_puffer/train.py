@@ -2,10 +2,10 @@ import functools
 import importlib
 import os
 import sqlite3
+import sys
 import warnings
 from tempfile import NamedTemporaryFile
 import time
-import uuid
 from contextlib import contextmanager, nullcontext
 from enum import Enum
 from multiprocessing import Queue
@@ -54,6 +54,8 @@ DEFAULT_POLICY = "multi_convolutional.MultiConvolutionalPolicy"
 DEFAULT_REWARD = "baseline.ObjectRewardRequiredEventsMapIdsFieldMoves"
 DEFAULT_WRAPPER = "baseline"
 DEFAULT_ROM = "train_skill_red.gb"
+# Default run folder: runs/<DEFAULT_EXP_ID>/ (model_*.pt, trainer_state.pt). Override with --exp-name / -e.
+DEFAULT_EXP_ID = "pokeSkill001"
 
 
 class Vectorization(Enum):
@@ -258,7 +260,7 @@ def init_wandb(
     reward_name: str,
     policy_name: str,
     wrappers_name: str,
-    resume: bool = True,
+    policy_checkpoint: dict[str, Any] | None = None,
 ):
     if not config.track:
         yield None
@@ -266,30 +268,49 @@ def init_wandb(
         assert config.wandb.project is not None, "Please set the wandb project in config.yaml"
         assert config.wandb.entity is not None, "Please set the wandb entity in config.yaml"
         run_label = exp_name if exp_name else config.train.exp_id
+        # W&B run id: new random id each launch so every run appears separately (not exp_id / pokeSkill001).
+        wandb_run_id = wandb.util.generate_id()
+        run_config: dict[str, Any] = {
+            "cleanrl": config.train,
+            "env": config.env,
+            "reward_module": reward_name,
+            "policy_module": policy_name,
+            "reward": config.rewards[reward_name],
+            "policy": config.policies[policy_name],
+            "wrappers": config.wrappers[wrappers_name],
+            "rnn": "rnn" in config.policies[policy_name],
+            "checkpoint_storage_exp_id": config.train.exp_id,
+            "wandb_run_id": wandb_run_id,
+        }
+        if policy_checkpoint is not None:
+            run_config["policy_checkpoint"] = policy_checkpoint
         wandb_kwargs = {
-            "id": config.train.exp_id,
+            "id": wandb_run_id,
             "project": config.wandb.project,
             "entity": config.wandb.entity,
             "group": config.wandb.group,
-            "config": {
-                "cleanrl": config.train,
-                "env": config.env,
-                "reward_module": reward_name,
-                "policy_module": policy_name,
-                "reward": config.rewards[reward_name],
-                "policy": config.policies[policy_name],
-                "wrappers": config.wrappers[wrappers_name],
-                "rnn": "rnn" in config.policies[policy_name],
-            },
-            "name": run_label,
+            "config": run_config,
+            "name": f"{run_label}-{wandb_run_id}",
             "monitor_gym": True,
             "save_code": True,
-            "resume": resume,
+            "resume": False,
         }
         base_url = config.wandb.get("base_url")
         if base_url:
             wandb_kwargs["settings"] = wandb.Settings(base_url=str(base_url))
         client = wandb.init(**wandb_kwargs)
+        try:
+            client.summary["wandb_run_id"] = wandb_run_id
+            client.summary["checkpoint_storage_exp_id"] = config.train.exp_id
+            if policy_checkpoint is not None:
+                client.summary["checkpoint_status"] = policy_checkpoint["status"]
+                client.summary["policy_checkpoint"] = policy_checkpoint
+        except Exception as exc:
+            print(
+                f"[checkpoint] could not write wandb summary: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
         yield client
         client.finish()
 
@@ -315,7 +336,7 @@ def setup(
             cuda_available=torch.cuda.is_available(),
         )
     rid = (run_id or "").strip()
-    config.train.exp_id = rid if rid else f"pokemon-red-{uuid.uuid4().hex[:8]}"
+    config.train.exp_id = rid if rid else DEFAULT_EXP_ID
     config.env.gb_path = rom_path
     config.track = track
     if debug:
@@ -346,31 +367,95 @@ def find_latest_model_path(data_dir: str | Path, exp_id: str) -> Path | None:
     return max(model_paths, key=lambda path: path.stat().st_mtime)
 
 
-def load_latest_policy_if_available(policy: nn.Module, config: DictConfig) -> nn.Module:
+def _torch_load_module_checkpoint(path: str | Path, map_location: str | torch.device):
+    """Saved files are full ``nn.Module`` pickles, not ``state_dict``. PyTorch 2.6+ defaults ``weights_only=True``."""
+    try:
+        return torch.load(path, map_location=map_location, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
+
+
+def _report_policy_checkpoint(run_dir: Path, detail: str) -> None:
+    """W&B / Rich often hide stdout; stderr + a small file in the run dir stay inspectable."""
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
+    block = f"[checkpoint] {stamp}\n{detail}\n"
+    banner = "\n" + "=" * 72 + "\n" + block + "=" * 72 + "\n"
+    print(banner, file=sys.stderr, flush=True)
+    print(banner, flush=True)
+    try:
+        run_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / "checkpoint_load.log").write_text(block, encoding="utf-8")
+    except OSError as exc:
+        print(
+            f"[checkpoint] could not write {run_dir / 'checkpoint_load.log'}: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
+def load_latest_policy_if_available(
+    policy: nn.Module, config: DictConfig
+) -> tuple[nn.Module, dict[str, Any]]:
     run_dir = Path(config.train.data_dir) / config.train.exp_id
     latest_model_path = find_latest_model_path(config.train.data_dir, config.train.exp_id)
+    exp_id = config.train.exp_id
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
+    base_info: dict[str, Any] = {
+        "logged_at": stamp,
+        "exp_id": exp_id,
+        "run_dir": str(run_dir.resolve()),
+        "model_path": None,
+        "model_file": None,
+        "error": None,
+    }
     if latest_model_path is None:
-        print(
-            f"[checkpoint] No weights to load under {run_dir.resolve()} "
-            f"(exp_id={config.train.exp_id}). Using newly initialized policy."
+        base_info["status"] = "none"
+        _report_policy_checkpoint(
+            run_dir,
+            "\n".join(
+                [
+                    f"No model_*.pt under {run_dir.resolve()}",
+                    f"exp_id={exp_id}",
+                    "Action: using newly initialized policy.",
+                ]
+            ),
         )
-        return policy
+        return policy, base_info
 
+    base_info["model_path"] = str(latest_model_path.resolve())
+    base_info["model_file"] = latest_model_path.name
     try:
-        print(
-            f"[checkpoint] Loading policy weights from {latest_model_path.resolve()} "
-            f"(exp_id={config.train.exp_id})"
+        loaded_policy = _torch_load_module_checkpoint(
+            latest_model_path, config.train.device
         )
-        loaded_policy = torch.load(latest_model_path, map_location=config.train.device)
         loaded_policy = loaded_policy.to(config.train.device)
-        print("[checkpoint] Load finished; continuing training with these weights.")
-        return loaded_policy
-    except Exception as exc:
-        print(
-            f"[checkpoint] Load failed ({latest_model_path}). "
-            f"Using freshly initialized policy. Error: {exc}"
+        base_info["status"] = "loaded"
+        _report_policy_checkpoint(
+            run_dir,
+            "\n".join(
+                [
+                    f"Loaded OK: {latest_model_path.resolve()}",
+                    f"exp_id={exp_id}",
+                    "Continuing training with these weights.",
+                ]
+            ),
         )
-        return policy
+        return loaded_policy, base_info
+    except Exception as exc:
+        base_info["status"] = "failed"
+        base_info["error"] = str(exc)[:4000]
+        _report_policy_checkpoint(
+            run_dir,
+            "\n".join(
+                [
+                    f"Load failed: {latest_model_path.resolve()}",
+                    f"exp_id={exp_id}",
+                    f"Error: {exc!r}",
+                    "Action: using newly initialized policy.",
+                ]
+            ),
+        )
+        return policy, base_info
 
 
 @app.command()
@@ -570,7 +655,7 @@ def train(
             "--exp-name",
             "-e",
             help="Run id and folder name under train.data_dir (e.g. runs/<exp-name>/). "
-            "Reuse the same value to load the latest checkpoint from that run.",
+            f"If omitted, uses {DEFAULT_EXP_ID!r}. Pass another name for a separate checkpoint directory.",
         ),
     ] = None,
     rom_path: Annotated[
@@ -596,65 +681,68 @@ def train(
     )
     run_root = Path(config.train.data_dir) / config.train.exp_id
     print(f"[train] exp_id={config.train.exp_id}\n[train] run directory: {run_root.resolve()}")
-    with init_wandb(
-        config=config,
-        exp_name=exp_name,
-        reward_name=reward_name,
-        policy_name=policy_name,
-        wrappers_name=wrappers_name,
-    ) as wandb_client:
-        vec = config.vectorization
-        if vec == Vectorization.serial:
-            vec = pufferlib.vector.Serial
-        elif vec == Vectorization.multiprocessing:
-            vec = pufferlib.vector.Multiprocessing
-        elif vec == Vectorization.ray:
-            vec = pufferlib.vector.Ray
-        else:
-            vec = pufferlib.vector.Multiprocessing
 
-        # TODO: Remove the +1 once the driver env doesn't permanently increase the env id
-        env_send_queues = []
-        env_recv_queues = []
-        if config.train.get("async_wrapper", False):
-            env_send_queues = [Queue() for _ in range(2 * config.train.num_envs + 1)]
-            env_recv_queues = [Queue() for _ in range(2 * config.train.num_envs + 1)]
+    vec = config.vectorization
+    if vec == Vectorization.serial:
+        vec = pufferlib.vector.Serial
+    elif vec == Vectorization.multiprocessing:
+        vec = pufferlib.vector.Multiprocessing
+    elif vec == Vectorization.ray:
+        vec = pufferlib.vector.Ray
+    else:
+        vec = pufferlib.vector.Multiprocessing
 
-        sqlite_context = nullcontext
+    # TODO: Remove the +1 once the driver env doesn't permanently increase the env id
+    env_send_queues = []
+    env_recv_queues = []
+    if config.train.get("async_wrapper", False):
+        env_send_queues = [Queue() for _ in range(2 * config.train.num_envs + 1)]
+        env_recv_queues = [Queue() for _ in range(2 * config.train.num_envs + 1)]
+
+    sqlite_context = nullcontext
+    if config.train.get("sqlite_wrapper", False):
+        sqlite_context = functools.partial(NamedTemporaryFile, suffix="sqlite")
+
+    # Vecenv + checkpoint load BEFORE wandb.init so [checkpoint] lines are not swallowed.
+    with sqlite_context() as sqlite_db:
+        db_filename = None
         if config.train.get("sqlite_wrapper", False):
-            sqlite_context = functools.partial(NamedTemporaryFile, suffix="sqlite")
+            db_filename = sqlite_db.name
+            with sqlite3.connect(db_filename) as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    "CREATE TABLE states(env_id INT PRIMARY KEY, pyboy_state BLOB, reset BOOLEAN, required_rate REAL, pid INT);"
+                )
 
-        with sqlite_context() as sqlite_db:
-            db_filename = None
-            if config.train.get("sqlite_wrapper", False):
-                db_filename = sqlite_db.name
-                with sqlite3.connect(db_filename) as conn:
-                    cur = conn.cursor()
-                    cur.execute(
-                        "CREATE TABLE states(env_id INT PRIMARY KEY, pyboy_state BLOB, reset BOOLEAN, required_rate REAL, pid INT);"
-                    )
-
-            vecenv = pufferlib.vector.make(
-                env_creator,
-                env_kwargs={
-                    "env_config": config.env,
-                    "wrappers_config": config.wrappers[wrappers_name],
-                    "reward_config": config.rewards[reward_name]["reward"],
-                    "async_config": {
-                        "send_queues": env_send_queues,
-                        "recv_queues": env_recv_queues,
-                    },
-                    "sqlite_config": {"database": db_filename},
+        vecenv = pufferlib.vector.make(
+            env_creator,
+            env_kwargs={
+                "env_config": config.env,
+                "wrappers_config": config.wrappers[wrappers_name],
+                "reward_config": config.rewards[reward_name]["reward"],
+                "async_config": {
+                    "send_queues": env_send_queues,
+                    "recv_queues": env_recv_queues,
                 },
-                num_envs=config.train.num_envs,
-                num_workers=config.train.num_workers,
-                batch_size=config.train.env_batch_size,
-                zero_copy=config.train.zero_copy,
-                backend=vec,
-            )
-            policy = make_policy(vecenv.driver_env, policy_name, config)
-            policy = load_latest_policy_if_available(policy, config)
+                "sqlite_config": {"database": db_filename},
+            },
+            num_envs=config.train.num_envs,
+            num_workers=config.train.num_workers,
+            batch_size=config.train.env_batch_size,
+            zero_copy=config.train.zero_copy,
+            backend=vec,
+        )
+        policy = make_policy(vecenv.driver_env, policy_name, config)
+        policy, policy_ckpt_info = load_latest_policy_if_available(policy, config)
 
+        with init_wandb(
+            config=config,
+            exp_name=exp_name,
+            reward_name=reward_name,
+            policy_name=policy_name,
+            wrappers_name=wrappers_name,
+            policy_checkpoint=policy_ckpt_info,
+        ) as wandb_client:
             config.train.env = "Pokemon Red"
             with CleanPuffeRL(
                 exp_name=exp_name or config.train.exp_id,
@@ -673,7 +761,7 @@ def train(
                 except KeyboardInterrupt:
                     print("KeyboardInterrupt received. Saving checkpoint and stopping training...")
 
-            print("Done training")
+        print("Done training")
 
 
 if __name__ == "__main__":

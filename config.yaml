@@ -17,7 +17,7 @@ env:
   # How many ticks each environment step should take.
   action_freq: 24
   # Maximum number of steps per mini-episode.
-  max_steps: 19816
+  max_steps: 16000
   # If true, save videos.
   save_video: False
   # If true, save sped up videos.
@@ -139,20 +139,21 @@ train:
   update_epochs: 3
   # If true, use normalized advantage.
   norm_adv: True
-  # Entropy coefficient. More means more random actions.
-  ent_coef: 0.01001337416019442
+  # Entropy coefficient. 너무 낮으면 메인 액션이 한 키로 붕괴하기 쉬움.
+  ent_coef: 0.028
   # Generalized advantage estimate
   gae_lambda: 0.949936199629264
   # Decay parameter for advantage estimation.
   gamma: 0.9979900678597386
   # How strongly to clip gradients.
-  clip_coef: 0.1
+  # PPO trust region; 너무 좁으면 clipfrac 지표만 부풀고 업데이트가 잘림 (일반적으로 0.1–0.2).
+  clip_coef: 0.15
   clip_vloss: True
   # Learning rate.
-  learning_rate: 0.00019999482124740103
+  learning_rate: 0.0001
   # Max norm of the gradients
   max_grad_norm: 0.5
-  target_kl: ~
+  target_kl: 0.01
   vf_clip_coef: 0.1
   vf_coef: 0.5319333384064214
   # unused
@@ -213,6 +214,8 @@ train:
   required_rate: False
   # Auxiliary CE loss weight for hm_logits supervised by reward-machine hm_target.
   hm_aux_loss_coef: 0.02
+  # HM 보조 CE 라벨 스무딩 (0이면 비활성). train 코드에서 cross_entropy에 전달.
+  hm_aux_label_smoothing: 0.05
 
 # Wrappers to use for training.
 # Each wrapper is keyed by a name for the commandline.
@@ -248,12 +251,12 @@ rewards:
   baseline.ObjectRewardRequiredEventsMapIdsFieldMoves:
     reward:
       rm_enabled: true
-      rm_transition: 0.001
-      rm_cut_success: 4.0
-      rm_surf_success: 1.0
-      rm_flash_success: 5.0
-      rm_pokeflute_success: 5.0
-      step_penalty: 0.0003
+      rm_transition: 0.0005
+      rm_cut_success: 3.0
+      rm_surf_success: 0.5
+      rm_flash_success: 3.0
+      rm_pokeflute_success: 4.0
+      step_penalty: 0.0002
 
 
 # Policies to use for training.

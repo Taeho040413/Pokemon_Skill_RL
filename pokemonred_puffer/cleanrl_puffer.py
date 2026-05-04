@@ -145,7 +145,10 @@ def rollout(
     except:  # noqa: E722
         env = pufferlib.vector.make(env_creator, env_kwargs=env_kwargs)
 
-    agent = torch.load(model_path, map_location=device)
+    try:
+        agent = torch.load(model_path, map_location=device, weights_only=False)
+    except TypeError:
+        agent = torch.load(model_path, map_location=device)
 
     ob, _ = env.reset()
     driver = env.driver_env
@@ -643,6 +646,7 @@ class CleanPuffeRL:
             )
             self.experience.flatten_batch(advantages_np)
 
+        ppo_epochs_done = 0
         for _ in range(self.config.update_epochs):
             lstm_state = None
             for mb in range(self.experience.num_minibatches):
@@ -732,7 +736,11 @@ class CleanPuffeRL:
                         if hm_mask.any():
                             masked_logits = hm_logits_flat[hm_mask]
                             masked_target = hm_target_flat[hm_mask]
-                            hm_aux_loss = F.cross_entropy(masked_logits, masked_target)
+                            # 약한 스무딩으로 한 클래스(특히 CUT)로만 CE가 몰릴 때 로짓 붕괴를 완화.
+                            ls = float(self.config.get("hm_aux_label_smoothing", 0.05))
+                            hm_aux_loss = F.cross_entropy(
+                                masked_logits, masked_target, label_smoothing=ls
+                            )
                             hm_accuracy = (
                                 masked_logits.argmax(dim=-1) == masked_target
                             ).float().mean()
@@ -762,15 +770,24 @@ class CleanPuffeRL:
                     losses.old_approx_kl += old_approx_kl.item() / self.experience.num_minibatches
                     losses.approx_kl += approx_kl.item() / self.experience.num_minibatches
                     losses.clipfrac += clipfrac.item() / self.experience.num_minibatches
-            # `update_epochs` 루프 동안 losses를 누적하므로, HM aux 지표는
-            # 출력에서 정규화해서 해석 가능하게 만든다.
-            losses.hm_aux_loss /= self.config.update_epochs
-            losses.hm_accuracy /= self.config.update_epochs
-            losses.hm_non_none_frac /= self.config.update_epochs
+            ppo_epochs_done += 1
 
             if self.config.target_kl is not None:
                 if approx_kl > self.config.target_kl:
                     break
+
+        # clipfrac / KL / policy·value / HM aux 등은 PPO epoch마다 같은 방식으로 누적됨 → 돈 epoch 수로 나눠 평균 표시.
+        # entropy만 epoch마다 정책이 달라 누적 합이 익숙한 스케일이라 여기서는 나누지 않음.
+        if ppo_epochs_done > 0:
+            inv = 1.0 / float(ppo_epochs_done)
+            losses.policy_loss *= inv
+            losses.value_loss *= inv
+            losses.hm_aux_loss *= inv
+            losses.hm_accuracy *= inv
+            losses.hm_non_none_frac *= inv
+            losses.old_approx_kl *= inv
+            losses.approx_kl *= inv
+            losses.clipfrac *= inv
 
         with self.profile.train_misc:
             if self.config.anneal_lr:

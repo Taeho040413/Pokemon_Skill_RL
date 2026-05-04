@@ -49,7 +49,7 @@ from pokemonred_puffer.data.tm_hm import (
     TmHmMoves,
 )
 from pokemonred_puffer.global_map import GLOBAL_MAP_SHAPE, local_to_global
-from pokemonred_puffer.rewards.reward_machine import HMTarget, RewardMachineState
+from pokemonred_puffer.rewards.reward_machine import CUTTABLE_TILES, HMTarget, RewardMachineState
 
 PIXEL_VALUES = np.array([0, 85, 153, 255], dtype=np.uint8)
 VISITED_MASK_SHAPE = (144 // 16, 160 // 16, 1)
@@ -199,8 +199,6 @@ class RedGymEnv(Env):
             ),
             # Discrete is more apt, but pufferlib is slower at processing Discrete
             "direction": spaces.Box(low=0, high=4, shape=(1,), dtype=np.uint8),
-            "blackout_map_id": spaces.Box(low=0, high=0xF7, shape=(1,), dtype=np.uint8),
-            "battle_type": spaces.Box(low=0, high=4, shape=(1,), dtype=np.uint8),
             # "x": spaces.Box(low=0, high=255, shape=(1,), dtype=np.u`int8),
             # "y": spaces.Box(low=0, high=255, shape=(1,), dtype=np.uint8),
             "map_id": spaces.Box(low=0, high=0xF7, shape=(1,), dtype=np.uint8),
@@ -217,14 +215,8 @@ class RedGymEnv(Env):
             "type2": spaces.Box(low=0, high=0x1A, shape=(6,), dtype=np.uint8),
             "level": spaces.Box(low=0, high=100, shape=(6,), dtype=np.uint8),
             "maxHP": spaces.Box(low=0, high=714, shape=(6,), dtype=np.uint32),
-            "attack": spaces.Box(low=0, high=714, shape=(6,), dtype=np.uint32),
-            "defense": spaces.Box(low=0, high=714, shape=(6,), dtype=np.uint32),
-            "speed": spaces.Box(low=0, high=714, shape=(6,), dtype=np.uint32),
-            "special": spaces.Box(low=0, high=714, shape=(6,), dtype=np.uint32),
             "moves": spaces.Box(low=0, high=0xA4, shape=(6, 4), dtype=np.uint8),
-            # Add 4 for rival_3, game corner rocket, saffron guard and lapras
             "events": spaces.Box(low=0, high=1, shape=(320,), dtype=np.uint8),
-            "rival_3": spaces.Box(low=0, high=1, shape=(1,), dtype=np.uint8),
             "game_corner_rocket": spaces.Box(low=0, high=1, shape=(1,), dtype=np.uint8),
             "saffron_guard": spaces.Box(low=0, high=1, shape=(1,), dtype=np.uint8),
             "lapras": spaces.Box(low=0, high=1, shape=(1,), dtype=np.uint8),
@@ -232,6 +224,8 @@ class RedGymEnv(Env):
                 low=0, high=len(RewardMachineState) - 1, shape=(1,), dtype=np.uint8
             ),
             "hm_target": spaces.Box(low=0, high=len(HMTarget) - 1, shape=(1,), dtype=np.uint8),
+            # wTileInFrontOfPlayer — RM·컷/서핑 훅과 동일 기준으로 필드 HM 판단에 쓰임.
+            "tile_in_front": spaces.Box(low=0, high=255, shape=(1,), dtype=np.uint8),
         }
         if not self.skip_safari_zone:
             obs_dict["safari_steps"] = spaces.Box(low=0, high=502.0, shape=(1,), dtype=np.uint32)
@@ -675,8 +669,6 @@ class RedGymEnv(Env):
                 "direction": np.array(
                     self.read_m("wSpritePlayerStateData1FacingDirection") // 4, dtype=np.uint8
                 ),
-                "blackout_map_id": np.array(self.read_m("wLastBlackoutMap"), dtype=np.uint8),
-                "battle_type": np.array(self.read_m("wIsInBattle") + 1, dtype=np.uint8),
                 # "x": np.array(player_x, dtype=np.uint8),
                 # "y": np.array(player_y, dtype=np.uint8),
                 "map_id": np.array(self.read_m(0xD35E), dtype=np.uint8),
@@ -689,15 +681,8 @@ class RedGymEnv(Env):
                 "type2": np.array([self.party[i].Type2 for i in range(6)], dtype=np.uint8),
                 "level": np.array([self.party[i].Level for i in range(6)], dtype=np.uint8),
                 "maxHP": np.array([self.party[i].MaxHP for i in range(6)], dtype=np.uint32),
-                "attack": np.array([self.party[i].Attack for i in range(6)], dtype=np.uint32),
-                "defense": np.array([self.party[i].Defense for i in range(6)], dtype=np.uint32),
-                "speed": np.array([self.party[i].Speed for i in range(6)], dtype=np.uint32),
-                "special": np.array([self.party[i].Special for i in range(6)], dtype=np.uint32),
                 "moves": np.array([self.party[i].Moves for i in range(6)], dtype=np.uint8),
                 "events": np.array(self.events.asbytes, dtype=np.uint8),
-                "rival_3": np.array(
-                    self.read_m("wSSAnne2FCurScript") == 4, dtype=np.uint8
-                ),  # rival 3
                 "game_corner_rocket": np.array(
                     self.missables.get_missable("HS_GAME_CORNER_ROCKET"), np.uint8
                 ),  # game corner rocket
@@ -707,6 +692,9 @@ class RedGymEnv(Env):
                 "lapras": np.array(self.flags.get_bit("BIT_GOT_LAPRAS"), np.uint8),  # got lapras
                 "rm_state": np.array([self.get_reward_machine_state_id()], dtype=np.uint8),
                 "hm_target": np.array([self.get_reward_machine_hm_target_id()], dtype=np.uint8),
+                "tile_in_front": np.array(
+                    [self.get_tile_in_front_of_player()], dtype=np.uint8
+                ),
             }
             | (
                 {}
@@ -733,9 +721,6 @@ class RedGymEnv(Env):
         return False
 
     def step(self, action):
-        if self.step_count >= self.get_max_steps():
-            self.step_count = 0
-
         if self.save_video and self.step_count == 0:
             self.start_video()
 
@@ -776,6 +761,9 @@ class RedGymEnv(Env):
         self.update_tm_hm_obtained_move_ids()
         self.party_size = self.read_m("wPartyCount")
         self.update_max_op_level()
+        # RM·보상은 update_reward() 안에서 돈다. use_surf는 그보다 먼저 갱신해야
+        # RewardMachineContext.is_surfing이 같은 스텝의 wWalkBikeSurfState와 일치한다.
+        self.use_surf = 1 if self.read_m("wWalkBikeSurfState") == 0x2 else 0
         new_reward = self.update_reward()
         self.last_health = self.read_hp_fraction()
         self.update_map_progress()
@@ -785,9 +773,6 @@ class RedGymEnv(Env):
         self.taught_surf = self.check_if_party_has_hm(TmHmMoves.SURF.value)
         self.taught_strength = self.check_if_party_has_hm(TmHmMoves.STRENGTH.value)
         self.pokecenters[self.read_m("wLastBlackoutMap")] = 1
-        # 매 스텝 현재 서핑 상태를 동적으로 반영한다. 단방향(1만 set)이면 착지 후에도
-        # is_surfing=True가 고착돼 두 번째 서핑이 영구 차단된다.
-        self.use_surf = 1 if self.read_m("wWalkBikeSurfState") == 0x2 else 0
         if self.infinite_health:
             self.reverse_damage()
 
@@ -830,9 +815,12 @@ class RedGymEnv(Env):
         # we have a tolerance cause some events may be really hard to get
         if (new_required_events or new_required_items) and self.required_tolerance is not None:
             # calculate the current required completion percentage
-            # add 4 for rival3, game corner rocket, saffron guard and lapras
             required_completion = len(required_events) + len(required_items)
             reset = (required_completion - self.required_rate) > self.required_tolerance
+
+        if self.step_count >= self.get_max_steps():
+            reset = True
+            self.first = True
 
         if self.save_video:
             self.add_video_frame()
@@ -1438,7 +1426,7 @@ class RedGymEnv(Env):
             self.pyboy.symbol_lookup("wTileInFrontOfPlayer")[1]
         ]
         if context:
-            if wTileInFrontOfPlayer in [0x3D, 0x50]:
+            if wTileInFrontOfPlayer in CUTTABLE_TILES:
                 self.valid_cut_coords[coords] = 1
             else:
                 self.invalid_cut_coords[coords] = 1

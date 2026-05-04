@@ -279,11 +279,9 @@ REWARD_MACHINE_TRANSITIONS: tuple[RewardMachineTransition, ...] = (
         RewardMachineState.SURF_MON_SELECTED,
         RewardMachineState.SURF_SUCCESS,
         "rm_surf_success",
-        lambda ctx: (
-            ctx.can_use_surf
-            and ctx.is_surfing
-            and ctx.tile_in_front != SURF_TILE_IN_FRONT
-        ),
+        # 물 위에서는 앞 타일이 0x14인 프레임이 대부분이라 tile 조건을 두면 성공 전이가
+        # 거의 안 난다. valid_surf_coords_count 증분(_next_transition)으로 한 번만 지급.
+        lambda ctx: ctx.can_use_surf and ctx.is_surfing,
     ),
     RewardMachineTransition(
         RewardMachineState.SURF_SUCCESS,

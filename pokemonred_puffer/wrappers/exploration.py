@@ -160,18 +160,13 @@ class OnResetExplorationWrapper(gym.Wrapper):
                 self.env.unwrapped.explore_map *= 0
                 self.env.unwrapped.reward_explore_map *= 0
                 self.env.unwrapped.cut_explore_map *= 0
-                self.env.unwrapped.cut_tiles.clear()
                 self.env.unwrapped.seen_coords.clear()
                 self.env.unwrapped.seen_map_ids *= 0
                 self.env.unwrapped.seen_npcs.clear()
-                self.env.unwrapped.valid_cut_coords.clear()
-                self.env.unwrapped.invalid_cut_coords.clear()
-                self.env.unwrapped.valid_pokeflute_coords.clear()
-                self.env.unwrapped.invalid_pokeflute_coords.clear()
-                self.env.unwrapped.pokeflute_tiles.clear()
-                self.env.unwrapped.valid_surf_coords.clear()
-                self.env.unwrapped.invalid_surf_coords.clear()
-                self.env.unwrapped.surf_tiles.clear()
+                # HM 사용 좌표(valid_/invalid_*_coords, *_tiles)는 소프트 리셋에서 비우지 않는다.
+                # 소프트 리셋마다 비우면 RM이 같은 나무/물 타일을 다시 SUCCESS로 인식해
+                # rm_*_success_count가 cut_count(에피소드 말미 dict 크기)와 수십 배 어긋난다.
+                # 진짜 에피소드 reset(reset_mem)에서만 비우도록 둔다.
                 self.env.unwrapped.seen_warps.clear()
                 self.env.unwrapped.seen_hidden_objs.clear()
                 self.env.unwrapped.seen_signs.clear()
