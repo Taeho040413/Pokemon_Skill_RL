@@ -41,6 +41,17 @@ pyximport.install(setup_args={"include_dirs": np.get_include()})
 from pokemonred_puffer.c_gae import compute_gae  # type: ignore  # noqa: E402
 
 
+def torch_load_policy_checkpoint(path: str | pathlib.Path, *, map_location=None):
+    """Load a saved policy ``.pt`` (full ``nn.Module`` pickle). PyTorch 2.6+ defaults ``weights_only=True``, which rejects these checkpoints."""
+    kwargs = {}
+    if map_location is not None:
+        kwargs["map_location"] = map_location
+    try:
+        return torch.load(path, weights_only=False, **kwargs)
+    except TypeError:
+        return torch.load(path, **kwargs)
+
+
 def _safe_wandb_log(run, data: dict) -> None:
     """Avoid crashing training when W&B auth/network fails mid-run."""
     if run is None:
@@ -130,6 +141,49 @@ def _core_stats_only(stats: dict) -> dict:
     return out
 
 
+def _rollout_recurrent_core(agent: nn.Module) -> nn.Module | None:
+    """``RecurrentPolicy.policy`` (e.g. ``LSTMWrapper``) if present."""
+    inner = getattr(agent, "policy", None)
+    if inner is not None and hasattr(inner, "obs_shape"):
+        return inner
+    return None
+
+
+def _sync_lstm_obs_shape_with_driver(agent: nn.Module, driver_env) -> tuple[int, ...]:
+    """Align ``LSTMWrapper.obs_shape`` with the live vecenv driver.
+
+    Some checkpoints store a mismatched rank (e.g. ``(1, n)`` vs ``(n,)``). PufferLib then
+    rejects observations with ``Invalid input tensor shape`` even though the flat size matches.
+    """
+    live = tuple(driver_env.single_observation_space.shape)
+    rnn_core = _rollout_recurrent_core(agent)
+    if rnn_core is not None:
+        saved = tuple(rnn_core.obs_shape)
+        if saved != live and int(np.prod(saved)) == int(np.prod(live)):
+            rnn_core.obs_shape = live
+        elif saved != live:
+            raise ValueError(
+                f"Checkpoint RNN obs_shape {saved} does not match driver env {live} "
+                "(flat size differs). Use the same env / config.yaml as training."
+            )
+    return live
+
+
+def _ensure_vecenv_batch_obs(ob: np.ndarray, space_shape: tuple[int, ...]) -> np.ndarray:
+    """Ensure ``(num_envs, *space_shape)`` as produced during training rollouts."""
+    ob = np.asarray(ob)
+    if ob.shape == space_shape:
+        return ob[np.newaxis, ...]
+    tail = ob.shape[-len(space_shape) :]
+    if tail == space_shape:
+        return ob
+    if ob.size == int(np.prod(space_shape)):
+        return ob.reshape(1, *space_shape)
+    raise ValueError(
+        f"Observation shape {ob.shape} incompatible with observation_space {space_shape}"
+    )
+
+
 def rollout(
     env_creator,
     env_kwargs,
@@ -145,14 +199,19 @@ def rollout(
     except:  # noqa: E722
         env = pufferlib.vector.make(env_creator, env_kwargs=env_kwargs)
 
-    try:
-        agent = torch.load(model_path, map_location=device, weights_only=False)
-    except TypeError:
-        agent = torch.load(model_path, map_location=device)
+    if model_path is None:
+        raise ValueError("model_path is required for rollout")
+
+    agent = torch_load_policy_checkpoint(model_path, map_location=device)
 
     ob, _ = env.reset()
     driver = env.driver_env
-    os.system("clear")
+    space_shape = _sync_lstm_obs_shape_with_driver(agent, driver)
+    ob = _ensure_vecenv_batch_obs(ob, space_shape)
+    if os.name == "nt":
+        os.system("cls")
+    else:
+        os.system("clear")
     state = None
 
     while True:
@@ -178,6 +237,7 @@ def rollout(
             action = action.cpu().numpy().reshape(env.action_space.shape)
 
         ob, reward = env.step(action)[:2]
+        ob = _ensure_vecenv_batch_obs(ob, space_shape)
         reward = reward.mean()
         print(f"Reward: {reward:.4f}")
 

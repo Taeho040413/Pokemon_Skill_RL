@@ -1,6 +1,7 @@
 import functools
 import importlib
 import os
+import re
 import sqlite3
 import sys
 import warnings
@@ -393,6 +394,93 @@ def _report_policy_checkpoint(run_dir: Path, detail: str) -> None:
         )
 
 
+def find_newest_saved_model(data_dir: str | Path) -> Path | None:
+    """Newest `model_*.pt` anywhere under ``data_dir`` (e.g. all runs under `runs/`)."""
+    root = Path(data_dir)
+    if not root.is_dir():
+        return None
+
+    candidates = [path for path in root.rglob("model_*.pt") if path.is_file()]
+    if not candidates:
+        return None
+
+    return max(candidates, key=lambda path: path.stat().st_mtime)
+
+
+def _resolve_explicit_checkpoint_path(checkpoint_path: str | Path) -> Path | None:
+    """Return a resolved path if the checkpoint exists.
+
+    On Linux/WSL, a Windows absolute path like ``C:\\Users\\...`` is not understood by
+    :class:`pathlib.Path` the same way as on Windows; it is treated as a relative path and
+    gets joined with the current working directory. Map ``X:/...`` to ``/mnt/x/...`` when
+    needed so ``--checkpoint`` works from WSL shells.
+    """
+    raw = os.fspath(checkpoint_path).strip().strip('"').strip("'")
+    normalized = raw.replace("\\", "/")
+    try_paths: list[Path] = [Path(raw)]
+    if os.name != "nt":
+        match = re.match(r"^([A-Za-z]):(?:/(.*))?$", normalized)
+        if match:
+            drive = match.group(1).lower()
+            rest = (match.group(2) or "").strip("/")
+            if rest:
+                try_paths.append(Path(f"/mnt/{drive}/{rest}"))
+    for candidate in try_paths:
+        if candidate.is_file():
+            return candidate.resolve()
+    return None
+
+
+def resolve_checkpoint_for_rollout(
+    *,
+    data_dir: str | Path,
+    checkpoint_path: Path | None,
+    exp_name: str | None,
+) -> Path:
+    """Pick a checkpoint: explicit path, latest under one run, or newest under data_dir."""
+    if checkpoint_path is not None:
+        path = _resolve_explicit_checkpoint_path(checkpoint_path)
+        if path is None:
+            raw = os.fspath(checkpoint_path).strip().strip('"').strip("'")
+            tried = [str(Path(raw).resolve())]
+            if os.name != "nt":
+                norm = raw.replace("\\", "/")
+                m = re.match(r"^([A-Za-z]):(?:/(.*))?$", norm)
+                if m:
+                    drive, rest = m.group(1).lower(), (m.group(2) or "").strip("/")
+                    if rest:
+                        tried.append(str((Path(f"/mnt/{drive}") / rest).resolve()))
+            raise typer.BadParameter(
+                "Checkpoint not found. Tried:\n  " + "\n  ".join(tried)
+            )
+        return path
+
+    exp = (exp_name or "").strip()
+    if exp:
+        found = find_latest_model_path(data_dir, exp)
+        if found is None:
+            raise typer.BadParameter(
+                f"No model_*.pt under {(Path(data_dir) / exp).resolve()} (exp_name={exp!r})"
+            )
+        print(f"[evaluate] Using latest checkpoint for run {exp!r}: {found.resolve()}")
+        return found
+
+    found = find_newest_saved_model(data_dir)
+    if found is None:
+        raise typer.BadParameter(
+            f"No model_*.pt under {Path(data_dir).resolve()}. Train with save_checkpoint or pass "
+            f"--checkpoint / --exp-name."
+        )
+    print(f"[evaluate] Using newest checkpoint (all runs): {found.resolve()}")
+    return found
+
+
+def _apply_rollout_display_config(config: DictConfig, headless: bool) -> None:
+    """Interactive rollout: PyBoy SDL2 window + OpenCV preview need env.headless False."""
+    with open_dict(config.env):
+        config.env.headless = headless
+
+
 def load_latest_policy_if_available(
     policy: nn.Module, config: DictConfig
 ) -> tuple[nn.Module, dict[str, Any]]:
@@ -463,7 +551,24 @@ def evaluate(
     config: Annotated[
         DictConfig, typer.Option(help="Base configuration", parser=OmegaConf.load)
     ] = DEFAULT_CONFIG,
-    checkpoint_path: Path | None = None,
+    checkpoint_path: Annotated[
+        Path | None,
+        typer.Option(
+            "--checkpoint",
+            "-c",
+            help="Policy weights (.pt). If omitted, uses newest under train.data_dir "
+            "(or under one run when --exp-name is set).",
+        ),
+    ] = None,
+    exp_name: Annotated[
+        str | None,
+        typer.Option(
+            "--exp-name",
+            "-e",
+            help="Run folder under train.data_dir (e.g. same as train --exp-name). "
+            "Latest model_*.pt in that folder is used unless --checkpoint is set.",
+        ),
+    ] = None,
     policy_name: Annotated[
         str,
         typer.Option(
@@ -492,7 +597,16 @@ def evaluate(
         Path,
         typer.Argument(help="Game Boy ROM path (.gb)."),
     ] = Path(DEFAULT_ROM),
+    headless: Annotated[
+        bool,
+        typer.Option(
+            "--headless",
+            help="No PyBoy window (null display). Default opens SDL2 game window for play.",
+        ),
+    ] = False,
 ):
+    config = load_from_config(config, False)
+    _apply_rollout_display_config(config, headless=headless)
     config, env_creator = setup(
         config=config,
         debug=False,
@@ -500,6 +614,11 @@ def evaluate(
         reward_name=reward_name,
         rom_path=rom_path,
         track=False,
+    )
+    model_path = resolve_checkpoint_for_rollout(
+        data_dir=config.train.data_dir,
+        checkpoint_path=checkpoint_path,
+        exp_name=exp_name,
     )
     env_kwargs = {
         "env_config": config.env,
@@ -511,11 +630,69 @@ def evaluate(
         cleanrl_puffer.rollout(
             env_creator,
             env_kwargs,
-            model_path=checkpoint_path,
+            model_path=model_path,
             device=config.train.device,
         )
     except KeyboardInterrupt:
         os._exit(0)
+
+
+@app.command("play")
+def play(
+    config: Annotated[
+        DictConfig, typer.Option(help="Base configuration", parser=OmegaConf.load)
+    ] = DEFAULT_CONFIG,
+    checkpoint_path: Annotated[
+        Path | None,
+        typer.Option(
+            "--checkpoint",
+            "-c",
+            help="Policy weights (.pt). If omitted, uses newest under train.data_dir.",
+        ),
+    ] = None,
+    exp_name: Annotated[
+        str | None,
+        typer.Option(
+            "--exp-name",
+            "-e",
+            help="Run folder under train.data_dir; latest checkpoint in that folder.",
+        ),
+    ] = None,
+    policy_name: Annotated[
+        str,
+        typer.Option("--policy-name", "-p", help="Policy module to use in policies."),
+    ] = DEFAULT_POLICY,
+    reward_name: Annotated[
+        str,
+        typer.Option("--reward-name", "-r", help="Reward module to use in rewards"),
+    ] = DEFAULT_REWARD,
+    wrappers_name: Annotated[
+        str,
+        typer.Option("--wrappers-name", "-w", help="Wrappers stack name from config."),
+    ] = DEFAULT_WRAPPER,
+    rom_path: Annotated[
+        Path,
+        typer.Argument(help="Game Boy ROM path (.gb)."),
+    ] = Path(DEFAULT_ROM),
+    headless: Annotated[
+        bool,
+        typer.Option(
+            "--headless",
+            help="No PyBoy window. Default: SDL2 + OpenCV windows.",
+        ),
+    ] = False,
+):
+    """Load the latest (or chosen) checkpoint and run the policy with on-screen render (no training)."""
+    evaluate(
+        config=config,
+        checkpoint_path=checkpoint_path,
+        exp_name=exp_name,
+        policy_name=policy_name,
+        reward_name=reward_name,
+        wrappers_name=wrappers_name,
+        rom_path=rom_path,
+        headless=headless,
+    )
 
 
 @app.command()
