@@ -13,17 +13,17 @@ env:
   # Directory with pyboy save states to load from.
   state_dir: pyboy_states
   # File within state dir to load from.
-  init_state: training
+  init_state: training2
   # How many ticks each environment step should take.
   action_freq: 24
   # Maximum number of steps per mini-episode.
   max_steps: 16000
   # If true, save videos.
-  save_video: False
+  save_video: True
   # If true, save sped up videos.
-  fast_video: False
+  fast_video: True
   # Number of environments to save videos for.
-  n_record: 10
+  n_record: 4
   # If true, give all party members max base stats.
   perfect_ivs: False
   # If true, downsample the screen observation by 2.
@@ -190,7 +190,8 @@ train:
   # when required new events and items are observed.
   sqlite_wrapper: True
   # Save PyBoy states when new required events and items are observed.
-  archive_states: True
+  # When True, creates a timestamped folder (e.g. 20260504-162205) in cwd each run.
+  archive_states: False
   # When a new required events and items are observed, move
   # all environments to the save state for the environment that made 
   # the observation
@@ -251,12 +252,12 @@ rewards:
   baseline.ObjectRewardRequiredEventsMapIdsFieldMoves:
     reward:
       rm_enabled: true
-      rm_transition: 0.0005
+      rm_transition: 0.0003
       rm_cut_success: 3.0
       rm_surf_success: 0.5
-      rm_flash_success: 3.0
+      rm_flash_success: 4.0
       rm_pokeflute_success: 4.0
-      step_penalty: 0.0002
+      step_penalty: 0.00015
 
 
 # Policies to use for training.
@@ -286,7 +287,7 @@ policies:
 debug:
   env:
     headless: False
-    init_state: training
+    init_state: training2
     state_dir: pyboy_states
     max_steps: 19000
     log_frequency: 1

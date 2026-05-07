@@ -1,15 +1,22 @@
 import argparse
 import ast
-from datetime import datetime
-from functools import partial
 import os
 import pathlib
 import random
 import sqlite3
 import time
+import warnings
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
+from datetime import datetime
+from functools import partial
 from multiprocessing import Queue
+
+warnings.filterwarnings(
+    "ignore",
+    message=r"Using SDL2 binaries from pysdl2-dll.*",
+    category=UserWarning,
+)
 
 import numpy as np
 import pufferlib
@@ -37,7 +44,7 @@ from pokemonred_puffer.profile import Profile, Utilization
 from pokemonred_puffer.wrappers.sqlite import SqliteStateResetWrapper
 from pokemonred_puffer.rewards.reward_machine import HMTarget
 
-pyximport.install(setup_args={"include_dirs": np.get_include()})
+pyximport.install(setup_args={"include_dirs": [np.get_include()]})
 from pokemonred_puffer.c_gae import compute_gae  # type: ignore  # noqa: E402
 
 
@@ -82,6 +89,7 @@ def _wandb_environment_metrics(stats: dict) -> dict:
             "episode_length",
             "required_count",
             "stats/rm_transition_count",
+            "stats/rm_reward_total",
             "stats/rm_success_count",
             "stats/rm_cut_success_count",
             "stats/rm_surf_success_count",
@@ -115,6 +123,7 @@ _CORE_STAT_KEYS = {
     "required_count",
     "stats/required_count",
     "stats/rm_transition_count",
+    "stats/rm_reward_total",
     "stats/rm_success_count",
     "stats/rm_cut_success_count",
     "stats/rm_surf_success_count",
@@ -614,9 +623,12 @@ class CleanPuffeRL:
                             # print(f"\tWaiting for message from env-id {key}")
                             self.env_send_queues[key].get()
 
-                    print(
-                        f"State migration to {self.archive_path}/{str(hash(new_state_key))} complete"
-                    )
+                    if self.config.archive_states:
+                        print(
+                            f"State migration to {self.archive_path}/{str(hash(new_state_key))} complete"
+                        )
+                    else:
+                        print("State migration complete")
 
             self.stats = {}
 

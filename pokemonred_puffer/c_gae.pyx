@@ -1,4 +1,5 @@
-# distutils: define_macros=NPY_NO_DEPRECATED_API=NPY_1_7_API_VERSION
+# GCC/Clang: -D…  (MSVC를 쓰면 동일 매크로를 /DNPY_NO_DEPRECATED_API=NPY_1_7_API_VERSION 로 바꿀 것)
+# distutils: extra_compile_args=-DNPY_NO_DEPRECATED_API=NPY_1_7_API_VERSION
 # cython: language_level=3
 # cython: boundscheck=False
 # cython: initializedcheck=False

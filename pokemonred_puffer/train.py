@@ -54,7 +54,7 @@ DEFAULT_CONFIG = "config.yaml"
 DEFAULT_POLICY = "multi_convolutional.MultiConvolutionalPolicy"
 DEFAULT_REWARD = "baseline.ObjectRewardRequiredEventsMapIdsFieldMoves"
 DEFAULT_WRAPPER = "baseline"
-DEFAULT_ROM = "train_skill_red.gb"
+DEFAULT_ROM = "train_teach_skill.gb"
 # Default run folder: runs/<DEFAULT_EXP_ID>/ (model_*.pt, trainer_state.pt). Override with --exp-name / -e.
 DEFAULT_EXP_ID = "pokeSkill001"
 

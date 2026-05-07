@@ -49,7 +49,12 @@ from pokemonred_puffer.data.tm_hm import (
     TmHmMoves,
 )
 from pokemonred_puffer.global_map import GLOBAL_MAP_SHAPE, local_to_global
-from pokemonred_puffer.rewards.reward_machine import CUTTABLE_TILES, HMTarget, RewardMachineState
+from pokemonred_puffer.rewards.reward_machine import (
+    CUTTABLE_TILES,
+    DARK_CAVE_MAP_PAL_OFFSET,
+    HMTarget,
+    RewardMachineState,
+)
 
 PIXEL_VALUES = np.array([0, 85, 153, 255], dtype=np.uint8)
 VISITED_MASK_SHAPE = (144 // 16, 160 // 16, 1)
@@ -297,6 +302,10 @@ class RedGymEnv(Env):
         if not self.auto_use_surf:
             self.pyboy.hook_register(None, "SurfingAttemptFailed", self.surf_hook, context=False)
             self.pyboy.hook_register(None, "ItemUseSurfboard.surf", self.surf_hook, context=True)
+        if not self.auto_flash:
+            self.pyboy.hook_register(
+                None, "StartMenu_Pokemon.flash", self.flash_hook, None
+            )
 
         if self.disable_wild_encounters:
             self.setup_disable_wild_encounters()
@@ -460,6 +469,10 @@ class RedGymEnv(Env):
         self.invalid_surf_coords = {}
         self.surf_tiles = {}
 
+        self.valid_flash_coords = {}
+        self.invalid_flash_coords = {}
+        self.flash_tiles = {}
+
         self.seen_hidden_objs = {}
         self.seen_signs = {}
 
@@ -490,6 +503,9 @@ class RedGymEnv(Env):
         self.invalid_surf_coords = {}
         self.valid_pokeflute_coords = {}
         self.invalid_pokeflute_coords = {}
+        self.valid_flash_coords = {}
+        self.invalid_flash_coords = {}
+        self.flash_tiles = {}
 
     def render(self) -> npt.NDArray[np.uint8]:
         return self.screen.ndarray[:, :, 1]
@@ -725,7 +741,7 @@ class RedGymEnv(Env):
             self.start_video()
 
         _, wMapPalOffset = self.pyboy.symbol_lookup("wMapPalOffset")
-        if self.auto_flash and self.pyboy.memory[wMapPalOffset] == 6:
+        if self.auto_flash and self.pyboy.memory[wMapPalOffset] == DARK_CAVE_MAP_PAL_OFFSET:
             self.pyboy.memory[wMapPalOffset] = 0
 
         if self.auto_remove_all_nonuseful_items:
@@ -1480,6 +1496,31 @@ class RedGymEnv(Env):
         ]
         self.surf_tiles[wTileInFrontOfPlayer] = 1
 
+    def flash_hook(self, *args, **kwargs):
+        """StartMenu_Pokemon.flash 진입 시점: Flash를 한번이라도 사용했음을 기록한다.
+
+        기존에는 wMapPalOffset == DARK_CAVE_MAP_PAL_OFFSET(동굴 팔레트)에서만
+        valid_flash_coords로 카운트했지만, 이제는 "어두운 화면에서 Flash를 썼고
+        그 후 화면이 밝아지는지"를 RewardMachine 쪽에서 팔레트 기반으로 판정한다.
+        여기서는 위치/타일과 무관하게 Flash 사용 사건만 valid로 센다.
+        """
+        player_direction = self.pyboy.memory[
+            self.pyboy.symbol_lookup("wSpritePlayerStateData1FacingDirection")[1]
+        ]
+        x, y, map_id = self.get_game_coords()
+        if player_direction == 0:
+            coords = (x, y + 1, map_id)
+        if player_direction == 4:
+            coords = (x, y - 1, map_id)
+        if player_direction == 8:
+            coords = (x - 1, y, map_id)
+        if player_direction == 0xC:
+            coords = (x + 1, y, map_id)
+        # 타일/팔레트 상관없이 Flash 사용을 성공 시도(valid)로 기록한다.
+        self.valid_flash_coords[coords] = 1
+        w_tile = self.pyboy.memory[self.pyboy.symbol_lookup("wTileInFrontOfPlayer")[1]]
+        self.flash_tiles[w_tile] = 1
+
     def use_ball_hook(self, *args, **kwargs):
         self.use_ball_count += 1
 
@@ -1548,9 +1589,12 @@ class RedGymEnv(Env):
                 "invalid_pokeflute_coords": len(self.invalid_pokeflute_coords),
                 "valid_surf_coords": len(self.valid_surf_coords),
                 "invalid_surf_coords": len(self.invalid_surf_coords),
+                "valid_flash_coords": len(self.valid_flash_coords),
+                "invalid_flash_coords": len(self.invalid_flash_coords),
                 "rm_state": self.get_reward_machine_state_id(),
                 "hm_target": self.get_reward_machine_hm_target_id(),
                 "rm_transition_count": getattr(self, "rm_transition_count", 0),
+                "rm_reward_total": getattr(self, "rm_reward_total", 0.0),
                 "rm_success_count": getattr(self, "rm_success_count", 0),
                 "rm_cut_success_count": getattr(self, "rm_cut_success_count", 0),
                 "rm_surf_success_count": getattr(self, "rm_surf_success_count", 0),
@@ -1681,6 +1725,13 @@ class RedGymEnv(Env):
     def get_tile_in_front_of_player(self) -> int:
         _, addr = self.pyboy.symbol_lookup("wTileInFrontOfPlayer")
         return int(self.pyboy.memory[addr])
+
+    def get_map_pal_offset(self) -> int:
+        _, addr = self.pyboy.symbol_lookup("wMapPalOffset")
+        return int(self.pyboy.memory[addr])
+
+    def get_rm_flash_cycle_start(self) -> int:
+        return 0
 
     def get_max_steps(self):
         return max(

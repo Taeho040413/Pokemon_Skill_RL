@@ -25,19 +25,26 @@ _RM_NO_REWARD_KEYS = frozenset(
         "rm_cut_detected",
         "rm_surf_detected",
         "rm_pokeflute_detected",
+        "rm_flash_detected",
         "rm_cut_done",
         "rm_surf_done",
         "rm_pokeflute_done",
+        "rm_flash_done",
         "rm_failed_timeout",
         # *_DETECTED → IDLE 탈출 전이: 에이전트가 트리거 타일에서 벗어날 때 발생.
         "rm_cut_aborted",
         "rm_surf_aborted",
         "rm_pokeflute_aborted",
+        "rm_flash_aborted",
+        "rm_flash_left_dark",
     }
 )
 
 
 class BaselineRewardEnv(RedGymEnv):
+    def get_rm_flash_cycle_start(self) -> int:
+        return int(self.reward_machine.flash_cycle_start_count)
+
     def __init__(self, env_config: DictConfig, reward_config: DictConfig):
         self.reward_machine = RewardMachine()
         self.rm_reward_total = 0.0
@@ -54,6 +61,7 @@ class BaselineRewardEnv(RedGymEnv):
         self.rm_last_step_delta = 0.0
         self.last_rm_transition_key = ""
         self.missing_cut_reported = False
+        self._rm_flash_success_reward_paid = False
         super().__init__(env_config)
         self.reward_config = OmegaConf.to_object(reward_config)
 
@@ -73,6 +81,7 @@ class BaselineRewardEnv(RedGymEnv):
         self.rm_last_step_delta = 0.0
         self.last_rm_transition_key = ""
         self.missing_cut_reported = False
+        self._rm_flash_success_reward_paid = False
         return super().reset(*args, **kwargs)
 
     def _before_progress_reward(self) -> None:
@@ -104,12 +113,27 @@ class BaselineRewardEnv(RedGymEnv):
 
         self.ensure_cut_for_reward_machine()
         context = RewardMachineContext.from_env(self)
-        step = self.reward_machine.transition(context)
+        # 한 PyBoy step(에이전트 스텝) 안에서 메뉴→HM까지 모두 진행되면, 같은 스냅샷으로
+        # 여러 RM 전이가 연쇄되어야 한다. transition()은 1회 1전이만 하므로, 메뉴 플래그가
+        # 다음 스텝 맨 앞에 0으로 초기화되면 체인이 끊긴다.
+        _MAX_RM_CHAIN = 32
+        for _ in range(_MAX_RM_CHAIN):
+            step = self.reward_machine.transition(context)
+            if not step.changed or not step.transition_key:
+                break
+            # rm_flash_success 설정액은 에피소드당 1회만 누적 (RM이 재진입해도 중복 지급 방지).
+            if (
+                step.transition_key == "rm_flash_success"
+                and self._rm_flash_success_reward_paid
+            ):
+                self.last_rm_transition_key = step.transition_key
+                break
 
-        if step.changed and step.transition_key:
             amt = self._rm_reward_for_transition_key(step.transition_key)
+            if step.transition_key == "rm_flash_success":
+                self._rm_flash_success_reward_paid = True
             self.rm_reward_total += amt
-            self.rm_last_step_delta = amt
+            self.rm_last_step_delta += amt
             self.rm_transition_count += 1
             self.last_rm_transition_key = step.transition_key
             if step.transition_key in _RM_SUCCESS_KEYS:

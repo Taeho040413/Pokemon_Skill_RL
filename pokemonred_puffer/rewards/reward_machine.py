@@ -12,6 +12,8 @@ from pokemonred_puffer.data.tm_hm import TmHmMoves
 CUTTABLE_TILES = frozenset({0x3D, 0x50})
 SURF_TILE_IN_FRONT = 0x14
 POKEFLUTE_TILE_IN_FRONT = 0x43
+# pokered: 어두운 동굴 맵에서 wMapPalOffset == 6 (환경의 auto_flash와 동일 기준).
+DARK_CAVE_MAP_PAL_OFFSET = 6
 
 
 class HMTarget(IntEnum):
@@ -60,6 +62,8 @@ class RewardMachineEnv(Protocol):
     invalid_pokeflute_coords: dict
     valid_surf_coords: dict
     invalid_surf_coords: dict
+    valid_flash_coords: dict
+    invalid_flash_coords: dict
     use_surf: int
     seen_start_menu: int
     seen_pokemon_menu: int
@@ -71,6 +75,10 @@ class RewardMachineEnv(Protocol):
     def get_items_in_bag(self) -> Iterable[Items]: ...
 
     def get_tile_in_front_of_player(self) -> int: ...
+
+    def get_map_pal_offset(self) -> int: ...
+
+    def get_rm_flash_cycle_start(self) -> int: ...
 
 
 @dataclass(frozen=True)
@@ -99,6 +107,7 @@ class RewardMachineContext:
     # 서핑 성공 횟수: per-cycle count 가드에 사용. is_surfing은 물 위 모든 스텝에서 True라서
     # 단독으로 쓰면 매 스텝 SUCCESS가 발화한다.
     valid_surf_coords_count: int
+    valid_flash_coords_count: int
     used_pokeflute_successfully: bool
     # 포케플루트 성공 횟수: RewardMachine이 이번 RM 사이클 시작 시점과 비교해
     # "새로운" 사용이 있었는지 판단하는 데 쓴다. (에피소드 누적값이므로 증분만 의미 있음.)
@@ -113,11 +122,17 @@ class RewardMachineContext:
     invalid_cut_coords_count: int
     invalid_pokeflute_coords_count: int
     invalid_surf_coords_count: int
+    invalid_flash_coords_count: int
+    # 어두운 동굴 여부 (Flash 필요 맵). Flash 성공 직후에는 False가 된다.
+    in_dark_cave: bool
+    # 이번 FLASH 사이클(DETECTED 진입 시점) 이후 새 Flash 성공 훅이 있었는지.
+    flash_cycle_has_new_success: bool
 
     @classmethod
     def from_env(cls, env: RewardMachineEnv) -> RewardMachineContext:
         items = set(env.get_items_in_bag())
         events = env.events
+        _flash_start = int(env.get_rm_flash_cycle_start())
 
         return cls(
             step_count=env.step_count,
@@ -142,6 +157,7 @@ class RewardMachineContext:
             used_cut_successfully=bool(env.valid_cut_coords),
             valid_cut_coords_count=len(env.valid_cut_coords),
             valid_surf_coords_count=len(env.valid_surf_coords),
+            valid_flash_coords_count=len(env.valid_flash_coords),
             used_pokeflute_successfully=bool(env.valid_pokeflute_coords),
             valid_pokeflute_coords_count=len(env.valid_pokeflute_coords),
             used_surf_successfully=bool(env.valid_surf_coords) or bool(env.use_surf),
@@ -153,6 +169,12 @@ class RewardMachineContext:
             invalid_cut_coords_count=len(env.invalid_cut_coords),
             invalid_pokeflute_coords_count=len(env.invalid_pokeflute_coords),
             invalid_surf_coords_count=len(env.invalid_surf_coords),
+            invalid_flash_coords_count=len(env.invalid_flash_coords),
+            # 화면 팔레트가 기본(0)이 아니면 “어두운 화면”으로 간주한다.
+            # 기존 동굴 한정 조건(wMapPalOffset == DARK_CAVE_MAP_PAL_OFFSET)보다 완화해
+            # 다양한 어두운 연출에서도 Flash를 인정한다.
+            in_dark_cave=env.get_map_pal_offset() != 0,
+            flash_cycle_has_new_success=len(env.valid_flash_coords) > _flash_start,
         )
 
     @property
@@ -195,9 +217,6 @@ class RewardMachineStep:
         return self.previous_state != self.current_state
 
 
-# CUT / SURF / POKEFLUTE만 전이가 연결되어 있습니다. FLASH_* 상태·HMTarget·FAILED
-# 타임아웃 집합은 HM 보조 신호·확장용으로 두었으며, README의 FLASH 체인과 동일하게
-# 쓰려면 환경에서 flash 훅·좌표( cut/surf 와 동일 패턴)를 노출한 뒤 전이를 추가해야 합니다.
 REWARD_MACHINE_TRANSITIONS: tuple[RewardMachineTransition, ...] = (
     # ── CUT ──────────────────────────────────────────────────────────────────
     RewardMachineTransition(
@@ -214,6 +233,14 @@ REWARD_MACHINE_TRANSITIONS: tuple[RewardMachineTransition, ...] = (
         lambda ctx: ctx.tile_in_front in CUTTABLE_TILES
         and ctx.start_menu_open
         and ctx.can_use_cut,
+    ),
+    # auto_use_cut 등: 한 스텝 끝에 메뉴가 닫히고 나무도 제거된 스냅샷만 남으면
+    # CUT_DETECTED → ABORT만 반복되어 RM 보상이 0이 된다. valid_cut 증분으로 가드.
+    RewardMachineTransition(
+        RewardMachineState.CUT_DETECTED,
+        RewardMachineState.CUT_SUCCESS,
+        "rm_cut_success",
+        lambda ctx: ctx.can_use_cut and ctx.tile_in_front not in CUTTABLE_TILES,
     ),
     RewardMachineTransition(
         RewardMachineState.CUT_MENU_OPEN,
@@ -266,6 +293,14 @@ REWARD_MACHINE_TRANSITIONS: tuple[RewardMachineTransition, ...] = (
         lambda ctx: ctx.tile_in_front == SURF_TILE_IN_FRONT
         and ctx.start_menu_open
         and ctx.can_use_surf,
+    ),
+    # auto_use_surf: 최종 스냅샷에서 앞 타일이 물이 아니어도 is_surfing이면 성공.
+    # SURF_ABORT(앞 타일 불일치)와 경합하므로 이 엣지는 반드시 ABORT 앞에 둔다.
+    RewardMachineTransition(
+        RewardMachineState.SURF_DETECTED,
+        RewardMachineState.SURF_SUCCESS,
+        "rm_surf_success",
+        lambda ctx: ctx.can_use_surf and ctx.is_surfing,
     ),
     RewardMachineTransition(
         RewardMachineState.SURF_MENU_OPEN,
@@ -338,6 +373,67 @@ REWARD_MACHINE_TRANSITIONS: tuple[RewardMachineTransition, ...] = (
             ctx.tile_in_front != POKEFLUTE_TILE_IN_FRONT or not ctx.can_use_pokeflute
         ),
     ),
+
+    # ── FLASH (어두운 동굴 wMapPalOffset==6; 훅: StartMenu_Pokemon.flash) ─────
+    # IDLE 순서: CUT → SURF → POKEFLUTE → FLASH — 스노랙스 타일 등 구체 조건이 먼저.
+    RewardMachineTransition(
+        RewardMachineState.IDLE,
+        RewardMachineState.FLASH_DETECTED,
+        "rm_flash_detected",
+        lambda ctx: ctx.in_dark_cave and ctx.can_use_flash,
+    ),
+    RewardMachineTransition(
+        RewardMachineState.FLASH_DETECTED,
+        RewardMachineState.FLASH_MENU_OPEN,
+        "rm_flash_menu_open",
+        lambda ctx: ctx.in_dark_cave and ctx.start_menu_open and ctx.can_use_flash,
+    ),
+    # auto_flash off: 플래시 연출 후 밝은 스냅샷만 남으면 MON 경로 없이 성공 처리.
+    # rm_flash_aborted(밝음)와 경합 → ABORT보다 먼저 평가되게 둔다.
+    RewardMachineTransition(
+        RewardMachineState.FLASH_DETECTED,
+        RewardMachineState.FLASH_SUCCESS,
+        "rm_flash_success",
+        lambda ctx: (
+            ctx.can_use_flash
+            and not ctx.in_dark_cave
+            and ctx.flash_cycle_has_new_success
+        ),
+    ),
+    RewardMachineTransition(
+        RewardMachineState.FLASH_MENU_OPEN,
+        RewardMachineState.FLASH_MON_SELECTED,
+        "rm_flash_mon_selected",
+        lambda ctx: ctx.in_dark_cave and ctx.pokemon_menu_open and ctx.can_use_flash,
+    ),
+    RewardMachineTransition(
+        RewardMachineState.FLASH_MON_SELECTED,
+        RewardMachineState.FLASH_SUCCESS,
+        "rm_flash_success",
+        lambda ctx: (
+            ctx.can_use_flash
+            and not ctx.in_dark_cave
+            and ctx.flash_cycle_has_new_success
+        ),
+    ),
+    RewardMachineTransition(
+        RewardMachineState.FLASH_MON_SELECTED,
+        RewardMachineState.IDLE,
+        "rm_flash_left_dark",
+        lambda ctx: not ctx.in_dark_cave and not ctx.flash_cycle_has_new_success,
+    ),
+    RewardMachineTransition(
+        RewardMachineState.FLASH_SUCCESS,
+        RewardMachineState.IDLE,
+        "rm_flash_done",
+        lambda ctx: True,
+    ),
+    RewardMachineTransition(
+        RewardMachineState.FLASH_DETECTED,
+        RewardMachineState.IDLE,
+        "rm_flash_aborted",
+        lambda ctx: not ctx.in_dark_cave or not ctx.can_use_flash,
+    ),
 )
 
 
@@ -383,12 +479,14 @@ class RewardMachine:
         self._last_invalid_cut_coords_count: int | None = None
         self._last_invalid_surf_coords_count: int | None = None
         self._last_invalid_pokeflute_coords_count: int | None = None
+        self._last_invalid_flash_coords_count: int | None = None
 
         # IDLE→*_DETECTED는 “상승 에지”만: 같은 타일 앞에 서 있는 동안 매 스텝 재진입 방지.
         # 조건에서 벗어났다가(다른 타일/방향) 다시 맞으면 True로 재무장.
         self._idle_cut_entry_ok = True
         self._idle_surf_entry_ok = True
         self._idle_pokeflute_entry_ok = True
+        self._idle_flash_entry_ok = True
 
         # CUT / POKEFLUTE 사이클 시작 시점의 valid_*_coords_count 스냅샷.
         # *_MON_SELECTED / *_BAG_OPEN → SUCCESS 조건:
@@ -398,6 +496,7 @@ class RewardMachine:
         self._cut_cycle_start_count: int = 0
         self._surf_cycle_start_count: int = 0
         self._pokeflute_cycle_start_count: int = 0
+        self._flash_cycle_start_count: int = 0
 
 
     @property
@@ -412,6 +511,10 @@ class RewardMachine:
     def hm_target(self) -> HMTarget:
         return HM_TARGET_BY_STATE[self.state]
 
+    @property
+    def flash_cycle_start_count(self) -> int:
+        return self._flash_cycle_start_count
+
     def reset(self) -> None:
         self.state = RewardMachineState.IDLE
         self._last_step_count = None
@@ -420,12 +523,15 @@ class RewardMachine:
         self._last_invalid_cut_coords_count = None
         self._last_invalid_surf_coords_count = None
         self._last_invalid_pokeflute_coords_count = None
+        self._last_invalid_flash_coords_count = None
         self._idle_cut_entry_ok = True
         self._idle_surf_entry_ok = True
         self._idle_pokeflute_entry_ok = True
+        self._idle_flash_entry_ok = True
         self._cut_cycle_start_count = 0
         self._surf_cycle_start_count = 0
         self._pokeflute_cycle_start_count = 0
+        self._flash_cycle_start_count = 0
 
     def _rearm_idle_detect_entry(self, context: RewardMachineContext) -> None:
         if context.tile_in_front not in CUTTABLE_TILES or not context.can_use_cut:
@@ -441,6 +547,8 @@ class RewardMachine:
             or not context.can_use_pokeflute
         ):
             self._idle_pokeflute_entry_ok = True
+        if not context.in_dark_cave or not context.can_use_flash:
+            self._idle_flash_entry_ok = True
 
     def transition(self, context: RewardMachineContext) -> RewardMachineStep:
         previous_state = self.state
@@ -456,9 +564,11 @@ class RewardMachine:
             self._idle_cut_entry_ok = True
             self._idle_surf_entry_ok = True
             self._idle_pokeflute_entry_ok = True
+            self._idle_flash_entry_ok = True
             self._cut_cycle_start_count = 0
             self._surf_cycle_start_count = 0
             self._pokeflute_cycle_start_count = 0
+            self._flash_cycle_start_count = 0
             return RewardMachineStep(previous_state, self.state, None)
 
         if (
@@ -504,6 +614,9 @@ class RewardMachine:
                     self._idle_pokeflute_entry_ok = False
                     # 이 사이클에서 새로운 flute 사용이 있는지 판단하기 위해 현재 count를 기록.
                     self._pokeflute_cycle_start_count = context.valid_pokeflute_coords_count
+                elif self.state == RewardMachineState.FLASH_DETECTED:
+                    self._idle_flash_entry_ok = False
+                    self._flash_cycle_start_count = context.valid_flash_coords_count
         return RewardMachineStep(previous_state, self.state, transition.reward_key)
 
     def _update_state_duration(self, step_count: int) -> None:
@@ -522,10 +635,12 @@ class RewardMachine:
             self._last_invalid_cut_coords_count is None
             or self._last_invalid_surf_coords_count is None
             or self._last_invalid_pokeflute_coords_count is None
+            or self._last_invalid_flash_coords_count is None
         ):
             self._last_invalid_cut_coords_count = context.invalid_cut_coords_count
             self._last_invalid_surf_coords_count = context.invalid_surf_coords_count
             self._last_invalid_pokeflute_coords_count = context.invalid_pokeflute_coords_count
+            self._last_invalid_flash_coords_count = context.invalid_flash_coords_count
             self._invalid_increase_counter = 0
             return
 
@@ -538,12 +653,16 @@ class RewardMachine:
         pokeflute_delta = (
             context.invalid_pokeflute_coords_count - self._last_invalid_pokeflute_coords_count
         )
+        flash_delta = (
+            context.invalid_flash_coords_count - self._last_invalid_flash_coords_count
+        )
 
         # Update baselines every step; we only count deltas while the RM is
         # stuck in the corresponding menu/selection states.
         self._last_invalid_cut_coords_count = context.invalid_cut_coords_count
         self._last_invalid_surf_coords_count = context.invalid_surf_coords_count
         self._last_invalid_pokeflute_coords_count = context.invalid_pokeflute_coords_count
+        self._last_invalid_flash_coords_count = context.invalid_flash_coords_count
 
         # If we've already "succeeded" for the current HM stage, don't count invalids.
         if self.state in {RewardMachineState.CUT_MENU_OPEN, RewardMachineState.CUT_MON_SELECTED}:
@@ -556,6 +675,11 @@ class RewardMachine:
                 self._invalid_increase_counter = 0
             elif surf_delta > 0:
                 self._invalid_increase_counter += int(surf_delta)
+        elif self.state in {RewardMachineState.FLASH_MENU_OPEN, RewardMachineState.FLASH_MON_SELECTED}:
+            if context.flash_cycle_has_new_success:
+                self._invalid_increase_counter = 0
+            elif flash_delta > 0:
+                self._invalid_increase_counter += int(flash_delta)
         elif self.state in {RewardMachineState.POKEFLUTE_BAG_OPEN}:
             if context.used_pokeflute_successfully:
                 self._invalid_increase_counter = 0
@@ -584,17 +708,23 @@ class RewardMachine:
                     and not self._idle_pokeflute_entry_ok
                 ):
                     continue
-            # → CUT_SUCCESS: 이 사이클에서 실제 새 컷이 있어야 함.
-            if (
-                transition.target == RewardMachineState.CUT_SUCCESS
-                and context.valid_cut_coords_count <= self._cut_cycle_start_count
-            ):
-                continue
+                if (
+                    transition.target == RewardMachineState.FLASH_DETECTED
+                    and not self._idle_flash_entry_ok
+                ):
+                    continue
             # → SURF_SUCCESS: is_surfing은 물 위 매 스텝 True라서 단독으로 쓰면 폭주.
             # valid_surf_coords_count 증분(실제 surf_hook 발화)이 있어야만 SUCCESS 허용.
             if (
                 transition.target == RewardMachineState.SURF_SUCCESS
                 and context.valid_surf_coords_count <= self._surf_cycle_start_count
+            ):
+                continue
+            # → CUT_SUCCESS: DETECTED 지름길은 이번 사이클에서 새 valid_cut만 인정.
+            if (
+                transition.target == RewardMachineState.CUT_SUCCESS
+                and transition.source == RewardMachineState.CUT_DETECTED
+                and context.valid_cut_coords_count <= self._cut_cycle_start_count
             ):
                 continue
             # → POKEFLUTE_SUCCESS: 이 사이클에서 실제로 새 flute 사용이 있어야 함.
