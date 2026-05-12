@@ -205,16 +205,6 @@ class OnResetLowerToFixedValueWrapper(gym.Wrapper):
                 for k, v in self.env.unwrapped.invalid_cut_coords.items()
                 if v > 0
             )
-            self.env.unwrapped.valid_pokeflute_coords.update(
-                (k, self.fixed_value["valid_pokeflute"])
-                for k, v in self.env.unwrapped.valid_pokeflute_coords.items()
-                if v > 0
-            )
-            self.env.unwrapped.invalid_pokeflute_coords.update(
-                (k, self.fixed_value["invalid_pokeflute"])
-                for k, v in self.env.unwrapped.invalid_pokeflute_coords.items()
-                if v > 0
-            )
             self.env.unwrapped.valid_surf_coords.update(
                 (k, self.fixed_value["valid_surf"])
                 for k, v in self.env.unwrapped.valid_surf_coords.items()

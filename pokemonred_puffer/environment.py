@@ -172,7 +172,6 @@ class RedGymEnv(Env):
         self.auto_use_surf = env_config.auto_use_surf
         self.auto_solve_strength_puzzles = env_config.auto_solve_strength_puzzles
         self.auto_remove_all_nonuseful_items = env_config.auto_remove_all_nonuseful_items
-        self.auto_pokeflute = env_config.auto_pokeflute
         self.auto_next_elevator_floor = env_config.auto_next_elevator_floor
         self.skip_safari_zone = env_config.skip_safari_zone
         self.infinite_safari_steps = env_config.infinite_safari_steps
@@ -326,14 +325,6 @@ class RedGymEnv(Env):
         if not self.auto_use_cut:
             self.pyboy.hook_register(None, "UsedCut.nothingToCut", self.cut_hook, context=False)
             self.pyboy.hook_register(None, "UsedCut.canCut", self.cut_hook, context=True)
-        # there is already an event for waking up the snorlax. No need to make a hookd for it
-        if not self.auto_pokeflute:
-            self.pyboy.hook_register(
-                None, "ItemUsePokeFlute.noSnorlaxToWakeUp", self.pokeflute_hook, context=False
-            )
-            self.pyboy.hook_register(
-                None, "PlayedFluteHadEffectText.done", self.pokeflute_hook, context=True
-            )
         if not self.auto_use_surf:
             self.pyboy.hook_register(None, "SurfingAttemptFailed", self.surf_hook, context=False)
             self.pyboy.hook_register(None, "ItemUseSurfboard.surf", self.surf_hook, context=True)
@@ -502,17 +493,11 @@ class RedGymEnv(Env):
         self.invalid_cut_coords = {}
         self.cut_tiles = {}
 
-        self.valid_pokeflute_coords = {}
-        self.invalid_pokeflute_coords = {}
-        self.pokeflute_tiles = {}
-
         self.valid_surf_coords = {}
         self.invalid_surf_coords = {}
-        self.surf_tiles = {}
 
         self.valid_flash_coords = {}
         self.invalid_flash_coords = {}
-        self.flash_tiles = {}
 
         self.seen_hidden_objs = {}
         self.seen_signs = {}
@@ -536,17 +521,12 @@ class RedGymEnv(Env):
         # 에피소드마다 필드무브 시도/성공 추적을 비워 훅·통계가 리셋 후 깨끗이 쌓이게 함.
         # (reward_machine 진입은 tile_in_front 기준이며 cut_tiles 누적에는 의존하지 않음.)
         self.cut_tiles = {}
-        self.surf_tiles = {}
-        self.pokeflute_tiles = {}
         self.valid_cut_coords = {}
         self.invalid_cut_coords = {}
         self.valid_surf_coords = {}
         self.invalid_surf_coords = {}
-        self.valid_pokeflute_coords = {}
-        self.invalid_pokeflute_coords = {}
         self.valid_flash_coords = {}
         self.invalid_flash_coords = {}
-        self.flash_tiles = {}
 
     def render(self) -> npt.NDArray[np.uint8]:
         return self.screen.ndarray[:, :, 1]
@@ -1030,9 +1010,6 @@ class RedGymEnv(Env):
             if not self.check_if_party_has_hm(TmHmMoves.STRENGTH.value) and self.auto_use_strength:
                 self.use_strength()
 
-        if self.events.get_event("EVENT_GOT_POKE_FLUTE") and self.auto_pokeflute:
-            self.use_pokeflute()
-
         if self.get_game_coords() == (18, 4, 7) and self.skip_safari_zone:
             self.skip_safari_zone_atn()
 
@@ -1078,105 +1055,6 @@ class RedGymEnv(Env):
                         self.pyboy.memory[pp_addr + slot] = pp
                         # fill up pp: 30/30
                         break
-
-    def use_pokeflute(self):
-        in_overworld = self.read_m("wCurMapTileset") == Tilesets.OVERWORLD.value
-        # not in battle
-        _, _, map_id = self.get_game_coords()
-        if (
-            in_overworld
-            and self.read_m(0xD057) == 0
-            and map_id in (MapIds.ROUTE_12.value, MapIds.ROUTE_16.value)
-            and not (
-                self.events.get_event("EVENT_BEAT_ROUTE12_SNORLAX")
-                and map_id == MapIds.ROUTE_12.value
-            )
-            and not (
-                self.events.get_event("EVENT_BEAT_ROUTE16_SNORLAX")
-                and map_id == MapIds.ROUTE_16.value
-            )
-        ):
-            _, wBagItems = self.pyboy.symbol_lookup("wBagItems")
-            bag_items = self.pyboy.memory[wBagItems : wBagItems + 40]
-            if Items.POKE_FLUTE.value not in bag_items[::2]:
-                return
-            pokeflute_index = bag_items[::2].index(Items.POKE_FLUTE.value)
-
-            # Check if we're on the snorlax coordinates
-
-            coords = self.get_game_coords()
-            if coords == (9, 62, 23):
-                self.pyboy.button("RIGHT", 8)
-                self.pyboy.tick(self.action_freq, render=True)
-            elif coords == (10, 63, 23):
-                self.pyboy.button("UP", 8)
-                self.pyboy.tick(self.action_freq, render=True)
-            elif coords == (10, 61, 23):
-                self.pyboy.button("DOWN", 8)
-                self.pyboy.tick(self.action_freq, render=True)
-            elif coords == (27, 10, 27):
-                self.pyboy.button("LEFT", 8)
-                self.pyboy.tick(self.action_freq, render=True)
-            elif coords == (27, 10, 25):
-                self.pyboy.button("RIGHT", 8)
-                self.pyboy.tick(self.action_freq, render=True)
-            else:
-                return
-            # Then check if snorlax is a missable object
-            # Then trigger snorlax
-
-            _, wMissableObjectFlags = self.pyboy.symbol_lookup("wMissableObjectFlags")
-            _, wMissableObjectList = self.pyboy.symbol_lookup("wMissableObjectList")
-            missable_objects_list = self.pyboy.memory[
-                wMissableObjectList : wMissableObjectList + 34
-            ]
-            missable_objects_list = missable_objects_list[: missable_objects_list.index(0xFF)]
-            missable_objects_sprite_ids = missable_objects_list[::2]
-            missable_objects_flags = missable_objects_list[1::2]
-            for sprite_id in missable_objects_sprite_ids:
-                picture_id = self.read_m(f"wSprite{sprite_id:02}StateData1PictureID")
-                flags_bit = missable_objects_flags[missable_objects_sprite_ids.index(sprite_id)]
-                flags_byte = flags_bit // 8
-                flag_bit = flags_bit % 8
-                flag_byte_value = self.read_bit(wMissableObjectFlags + flags_byte, flag_bit)
-                if picture_id == 0x43 and not flag_byte_value:
-                    # open start menu
-                    self.pyboy.button("START", 8)
-                    self.pyboy.tick(self.action_freq, render=True)
-                    # scroll to bag
-                    # 2 is the item index for bag
-                    for _ in range(24):
-                        if self.read_m("wCurrentMenuItem") == 2:
-                            break
-                        self.pyboy.button("DOWN", 8)
-                        self.pyboy.tick(self.action_freq, render=True)
-                    self.pyboy.button("A", 8)
-                    self.pyboy.tick(self.action_freq, render=True)
-
-                    # Scroll until you get to pokeflute
-                    # We'll do this by scrolling all the way up then all the way down
-                    # There is a faster way to do it, but this is easier to think about
-                    # Could also set the menu index manually, but there are like 4 variables
-                    # for that
-                    for _ in range(20):
-                        self.pyboy.button("UP", 8)
-                        self.pyboy.tick(self.action_freq, render=True)
-
-                    for _ in range(21):
-                        if (
-                            self.read_m("wCurrentMenuItem") + self.read_m("wListScrollOffset")
-                            == pokeflute_index
-                        ):
-                            break
-                        self.pyboy.button("DOWN", 8)
-                        self.pyboy.tick(self.action_freq, render=True)
-
-                    # press a bunch of times
-                    for _ in range(5):
-                        self.pyboy.button("A", 8)
-                        self.pyboy.tick(4 * self.action_freq, render=True)
-
-                    break
 
     def cut_if_next(self):
         # https://github.com/pret/pokered/blob/d38cf5281a902b4bd167a46a7c9fd9db436484a7/constants/tileset_constants.asm#L11C8-L11C11
@@ -1561,28 +1439,6 @@ class RedGymEnv(Env):
         self.cut_tiles[wTileInFrontOfPlayer] = 1
         self.cut_explore_map[local_to_global(y, x, map_id)] = 1
 
-    def pokeflute_hook(self, context: bool):
-        player_direction = self.pyboy.memory[
-            self.pyboy.symbol_lookup("wSpritePlayerStateData1FacingDirection")[1]
-        ]
-        x, y, map_id = self.get_game_coords()  # x, y, map_id
-        if player_direction == 0:  # down
-            coords = (x, y + 1, map_id)
-        if player_direction == 4:
-            coords = (x, y - 1, map_id)
-        if player_direction == 8:
-            coords = (x - 1, y, map_id)
-        if player_direction == 0xC:
-            coords = (x + 1, y, map_id)
-        if context:
-            self.valid_pokeflute_coords[coords] = 1
-        else:
-            self.invalid_pokeflute_coords[coords] = 1
-        wTileInFrontOfPlayer = self.pyboy.memory[
-            self.pyboy.symbol_lookup("wTileInFrontOfPlayer")[1]
-        ]
-        self.pokeflute_tiles[wTileInFrontOfPlayer] = 1
-
     def surf_hook(self, context: bool, *args, **kwargs):
         player_direction = self.pyboy.memory[
             self.pyboy.symbol_lookup("wSpritePlayerStateData1FacingDirection")[1]
@@ -1603,7 +1459,6 @@ class RedGymEnv(Env):
         wTileInFrontOfPlayer = self.pyboy.memory[
             self.pyboy.symbol_lookup("wTileInFrontOfPlayer")[1]
         ]
-        self.surf_tiles[wTileInFrontOfPlayer] = 1
 
     def flash_hook(self, *args, **kwargs):
         """Record Flash usage.
@@ -1630,8 +1485,6 @@ class RedGymEnv(Env):
             self.valid_flash_coords[coords] = 1
         else:
             self.invalid_flash_coords[coords] = 1
-        w_tile = self.pyboy.memory[self.pyboy.symbol_lookup("wTileInFrontOfPlayer")[1]]
-        self.flash_tiles[w_tile] = 1
 
     def use_ball_hook(self, *args, **kwargs):
         self.use_ball_count += 1
@@ -1697,8 +1550,6 @@ class RedGymEnv(Env):
                 "cut_count": len(self.valid_cut_coords),
                 "valid_cut_coords": len(self.valid_cut_coords),
                 "invalid_cut_coords": len(self.invalid_cut_coords),
-                "valid_pokeflute_coords": len(self.valid_pokeflute_coords),
-                "invalid_pokeflute_coords": len(self.invalid_pokeflute_coords),
                 "valid_surf_coords": len(self.valid_surf_coords),
                 "invalid_surf_coords": len(self.invalid_surf_coords),
                 "valid_flash_coords": len(self.valid_flash_coords),
@@ -1711,9 +1562,6 @@ class RedGymEnv(Env):
                 "rm_success_count": getattr(self, "rm_success_count", 0),
                 "rm_cut_success_count": getattr(self, "rm_cut_success_count", 0),
                 "rm_surf_success_count": getattr(self, "rm_surf_success_count", 0),
-                "rm_pokeflute_success_count": getattr(
-                    self, "rm_pokeflute_success_count", 0
-                ),
                 "rm_flash_success_count": getattr(self, "rm_flash_success_count", 0),
                 "rm_intermediate_paid_count": getattr(
                     self, "rm_intermediate_paid_count", 0

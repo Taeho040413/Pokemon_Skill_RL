@@ -5,12 +5,12 @@ PufferLib 기반 Pokemon Red 강화학습 베이스. 본 저장소는 Reward Mac
 - `Reward Machine` → `rm_state`, `hm_target`, `rm_reward`
 - `Encoder (CNN/Conv/MLP)` 입력: 화면/RAM observation + `rm_state` embedding
 - `Encoder` → 특징 벡터 `z`
-- `HM Head (MLP)` → `hm_logits` (5차원: `cut, surf, flash, pokeflute, none`)
+- `HM Head (MLP)` → `hm_logits` (4차원: `cut, surf, flash, none`)
 - `z_aug = concat(z, α · hm_probs)` → PPO Policy 입력
-- 고정 `Action Map (5×7)`로부터 `action_bias = β · (hm_probs @ ActionMap)`
+- 고정 `Action Map (4×7)`로부터 `action_bias = β · (hm_probs @ ActionMap)`
 - `final_action_logits = action_logits + action_bias` → softmax → 행동
 - `shaped_reward = env_reward + rm_reward` → PPO update
-- `hm_aux_loss = CE(hm_logits, hm_target)`는 `train.hm_aux_loss_coef`로 약하게 보조 학습
+- `hm_aux_loss = CE(hm_logits, hm_supervision_target)`는 `train.hm_aux_loss_coef`로 약하게 보조 학습
 
 ## 설치
 
@@ -42,7 +42,6 @@ python3 -m pokemonred_puffer.train --config config.yaml --debug
 
 CUT_DETECTED -> CUT_MENU_OPEN -> CUT_MON_SELECTED -> CUT_SUCCESS
 FLASH_DETECTED -> FLASH_MENU_OPEN -> FLASH_MON_SELECTED -> FLASH_SUCCESS
-POKEFLUTE_DETECTED -> POKEFLUTE_BAG_OPEN -> POKEFLUTE_SUCCESS
 SURF_DETECTED -> SURF_MENU_OPEN -> SURF_MON_SELECTED -> SURF_SUCCESS
 SURF_SUCCESS -> IDLE
 
@@ -62,7 +61,6 @@ FAILED
 cut       -> A
 surf      -> A
 flash     -> Start
-pokeflute -> A
 none      -> no bias
 ```
 
@@ -82,7 +80,6 @@ policies:
   multi_convolutional.MultiConvolutionalPolicy:
     policy:
       hm_feature_alpha_init: 0.1
-      hm_action_beta_init: 0.1
 ```
 
 ## 디렉터리 구조

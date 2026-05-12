@@ -10,7 +10,6 @@ from pokemonred_puffer.environment import PIXEL_VALUES, VALID_ACTIONS_STR
 from pokemonred_puffer.rewards.reward_machine import HMTarget, RewardMachineState
 
 
-HM_ACTIONS = ("cut", "surf", "flash", "pokeflute", "none")
 HM_FEATURE_COUNT = len(HMTarget)
 HM_LOCAL_HINT_DIM = 2
 HM_LOCAL_HINT_HIDDEN_SIZE = 16
@@ -41,7 +40,6 @@ class MultiConvolutionalPolicy(nn.Module):
         rm_state_embedding_dim: int = 4,
         hm_hidden_size: int = 128,
         hm_feature_alpha_init: float = 0.1,
-        hm_action_beta_init: float = 0.1,
         channels_last: bool = True,
         downsample: int = 1,
     ):
@@ -110,7 +108,6 @@ class MultiConvolutionalPolicy(nn.Module):
         action_map[HMTarget.CUT, a_idx] = 1.0
         action_map[HMTarget.SURF, a_idx] = 1.0
         action_map[HMTarget.FLASH, start_idx] = 1.0
-        action_map[HMTarget.POKEFLUTE, a_idx] = 1.0
         self.register_buffer("hm_action_map", action_map, persistent=False)
 
         self.two_bit = env.unwrapped.env.two_bit

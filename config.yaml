@@ -54,8 +54,6 @@ env:
   auto_solve_strength_puzzles: True
   # If true, toss all unneeded items when the bag is full.
   auto_remove_all_nonuseful_items: True
-  # If true, use Pokeflute when next to a Snorlax if possible.
-  auto_pokeflute: False
   # If true, go to the next floor module num floors when entering an elevator.
   auto_next_elevator_floor: False
   # If true, automatically give the player the GOLD TEETH and HM03.
@@ -213,13 +211,13 @@ train:
   # If true, provide the percentage completion rate for required
   # items to the environments.
   required_rate: False
-  # Auxiliary CE loss weight for hm_logits supervised by reward-machine hm_target.
+  # Auxiliary CE loss weight for hm_logits supervised by hm_supervision_target.
   hm_aux_loss_coef: 0.03
   # IDLE(hm_target==NONE)에서 HM head가 CUT으로만 몰리지 않게: NONE CE를 비-NONE CE에 가산할 가중.
   # 0이면 기존과 동일(NONE은 비-NONE CE에만 간접 반영). 0.15~0.3 정도부터 시도.
   hm_none_ce_coef: 0.07
   # HM aux CE 라벨 스무딩. >0이면 “정답 아닌 클래스”에 대칭으로 질량이 가서
-  # prob1~prob4가 비슷한 잔여값(대시보드에 ~0.01씩)으로 보이기 쉬움. 똑바로 갈리게 하려면 0 권장.
+  # 여러 HM 확률이 비슷한 잔여값(대시보드에 ~0.01씩)으로 보이기 쉬움. 똑바로 갈리게 하려면 0 권장.
   hm_aux_label_smoothing: 0.0
   # HM head 엔트로피 보너스(균등에 가깝게). tail을 인위적으로 맞추므로 0 권장.
   hm_head_entropy_coef: 0.0
@@ -259,12 +257,11 @@ rewards:
     reward:
       rm_enabled: true
       rm_transition: 0.0001
-      rm_cut_success: 2.8
-      rm_surf_success: 1.5
-      rm_flash_success: 2.5
-      rm_pokeflute_success: 4.0
+      rm_cut_success: 2.4
+      rm_surf_success: 1.2
+      rm_flash_success: 1.0
       step_penalty: 0.00022
-      # Cut/Surf 시도했으나 무효(맨땅·잘못된 타일 등): invalid_cut/surf 좌표 증가당 -계수.
+      # Cut/Surf/Flash 시도했으나 무효(맨땅·잘못된 타일·밝은 곳 Flash 등): invalid 좌표 증가당 -계수.
       unnecessary_hm_usage_penalty: 0.05
 
 
@@ -279,15 +276,12 @@ policies:
       rm_state_embedding_dim: 4
       hm_hidden_size: 128
       hm_feature_alpha_init: 0.1
-      # HM 확률이 실제 액션으로 더 강하게 반영되도록 초기 bias 스케일을 키움.
-      # (현재 RM 라벨 다양성이 충분히 생성되기 전에 HM 경로가 action selection에 거의 영향이 없는 문제가 있어 보임)
-      hm_action_beta_init: 0.1
 
     rnn:
       # Assumed to be in the same module as the policy
       name: MultiConvolutionalRNN
       args:
-        input_size: 517
+        input_size: 516
         hidden_size: 512
         num_layers: 1
 
@@ -316,7 +310,6 @@ debug:
     auto_teach_strength: False
     auto_solve_strength_puzzles: False
     auto_remove_all_nonuseful_items: False
-    auto_pokeflute: False
     auto_next_elevator_floor: False
     skip_safari_zone: False
     infinite_safari_steps: False

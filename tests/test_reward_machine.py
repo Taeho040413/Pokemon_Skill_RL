@@ -9,8 +9,6 @@ import pytest
 
 from pokemonred_puffer.rewards.reward_machine import (
     CUTTABLE_TILES,
-    DARK_CAVE_MAP_PAL_OFFSET,
-    POKEFLUTE_TILE_IN_FRONT,
     SURF_TILE_IN_FRONT,
     RewardMachine,
     RewardMachineContext,
@@ -28,19 +26,14 @@ def _ctx(**overrides) -> RewardMachineContext:
     """기본값(아무 HM 없음, 밝은 필드, 메뉴 닫힘)을 가진 컨텍스트를 생성한다."""
     defaults = dict(
         step_count=0,
-        beat_brock=False, beat_misty=False, got_hm01=False, beat_lt_surge=False,
-        got_hm05=False, beat_rocket_hideout_giovanni=False, got_pokeflute=False,
-        beat_route12_snorlax=False, beat_route16_snorlax=False,
-        got_hm03=False, beat_koga=False,
-        has_cut=False, has_flash=False, has_surf=False, has_pokeflute=False,
+        has_cut=False, has_flash=False, has_surf=False,
         auto_flash=False,
         used_cut_successfully=False, valid_cut_coords_count=0,
         valid_surf_coords_count=0, valid_flash_coords_count=0,
-        used_pokeflute_successfully=False, valid_pokeflute_coords_count=0,
         used_surf_successfully=False, is_surfing=False,
         tile_in_front=0x00,
-        start_menu_open=False, pokemon_menu_open=False, bag_menu_open=False,
-        invalid_cut_coords_count=0, invalid_pokeflute_coords_count=0,
+        start_menu_open=False, pokemon_menu_open=False,
+        invalid_cut_coords_count=0,
         invalid_surf_coords_count=0, invalid_flash_coords_count=0,
         in_dark_cave=False, flash_cycle_has_new_success=False,
     )
@@ -327,52 +320,7 @@ class TestSurf:
 
 
 # ─────────────────────────────────────────────────────────────────
-# 3. POKEFLUTE
-# ─────────────────────────────────────────────────────────────────
-class TestPokeflute:
-    def test_happy_path(self):
-        rm = RewardMachine()
-        s = _step(rm, 0, has_pokeflute=True, tile_in_front=POKEFLUTE_TILE_IN_FRONT)
-        assert rm.state == RewardMachineState.POKEFLUTE_DETECTED
-        assert s.transition_key == "rm_pokeflute_detected"
-
-        s = _step(rm, 1, has_pokeflute=True, tile_in_front=POKEFLUTE_TILE_IN_FRONT, bag_menu_open=True)
-        assert rm.state == RewardMachineState.POKEFLUTE_BAG_OPEN
-        assert s.transition_key == "rm_pokeflute_bag_open"
-
-        # flute 성공: tile이 사라지고 new valid 발생
-        s = _step(rm, 2, has_pokeflute=True, tile_in_front=0x00,
-                  used_pokeflute_successfully=True, valid_pokeflute_coords_count=1)
-        assert rm.state == RewardMachineState.POKEFLUTE_SUCCESS
-        assert s.transition_key == "rm_pokeflute_success"
-
-        s = _step(rm, 3)
-        assert rm.state == RewardMachineState.IDLE
-        assert s.transition_key == "rm_pokeflute_done"
-
-    def test_abort_from_detected(self):
-        rm = RewardMachine()
-        _step(rm, 0, has_pokeflute=True, tile_in_front=POKEFLUTE_TILE_IN_FRONT)
-        s = _step(rm, 1, has_pokeflute=True, tile_in_front=0x00)
-        assert rm.state == RewardMachineState.IDLE
-        assert s.transition_key == "rm_pokeflute_aborted"
-
-    def test_pokeflute_uses_bag_menu_not_pokemon(self):
-        """Pokeflute는 bag_menu_open을 봐야 하고, pokemon_menu_open은 무시해야 함."""
-        rm = RewardMachine()
-        _step(rm, 0, has_pokeflute=True, tile_in_front=POKEFLUTE_TILE_IN_FRONT)
-        # pokemon_menu_open이어도 POKEFLUTE_BAG_OPEN으로 가면 안 됨
-        s = _step(rm, 1, has_pokeflute=True, tile_in_front=POKEFLUTE_TILE_IN_FRONT,
-                  pokemon_menu_open=True)
-        assert rm.state == RewardMachineState.POKEFLUTE_DETECTED
-        # bag_menu_open이어야 함
-        s = _step(rm, 2, has_pokeflute=True, tile_in_front=POKEFLUTE_TILE_IN_FRONT,
-                  bag_menu_open=True)
-        assert rm.state == RewardMachineState.POKEFLUTE_BAG_OPEN
-
-
-# ─────────────────────────────────────────────────────────────────
-# 4. FLASH
+# 3. FLASH
 # ─────────────────────────────────────────────────────────────────
 class TestFlash:
     def test_no_trigger_outside_dark_cave(self):
@@ -528,7 +476,7 @@ class TestFlash:
 
 
 # ─────────────────────────────────────────────────────────────────
-# 5. 우선순위: 동굴에서 컷 가능 타일 앞 → CUT이 FLASH보다 먼저
+# 4. 우선순위: 동굴에서 컷 가능 타일 앞 → CUT이 FLASH보다 먼저
 # ─────────────────────────────────────────────────────────────────
 class TestPriority:
     def test_cut_before_flash(self):
@@ -544,16 +492,9 @@ class TestPriority:
         s = _step(rm, 0, has_flash=True, tile_in_front=0x00, in_dark_cave=True)
         assert rm.state == RewardMachineState.FLASH_DETECTED
 
-    def test_pokeflute_before_flash(self):
-        """스노랙스 타일 앞, 어두운 동굴 → POKEFLUTE 먼저."""
-        rm = RewardMachine()
-        s = _step(rm, 0, has_pokeflute=True, has_flash=True,
-                  tile_in_front=POKEFLUTE_TILE_IN_FRONT, in_dark_cave=True)
-        assert rm.state == RewardMachineState.POKEFLUTE_DETECTED
-
 
 # ─────────────────────────────────────────────────────────────────
-# 6. HM Target 매핑 검증
+# 5. HM Target 매핑 검증
 # ─────────────────────────────────────────────────────────────────
 class TestHMTarget:
     @pytest.mark.parametrize("state,expected", [
@@ -564,8 +505,6 @@ class TestHMTarget:
         (RewardMachineState.SURF_SUCCESS, HMTarget.SURF),
         (RewardMachineState.FLASH_DETECTED, HMTarget.FLASH),
         (RewardMachineState.FLASH_SUCCESS, HMTarget.FLASH),
-        (RewardMachineState.POKEFLUTE_DETECTED, HMTarget.POKEFLUTE),
-        (RewardMachineState.POKEFLUTE_SUCCESS, HMTarget.POKEFLUTE),
         (RewardMachineState.FAILED, HMTarget.NONE),
     ])
     def test_mapping(self, state, expected):
@@ -574,7 +513,7 @@ class TestHMTarget:
 
 
 # ─────────────────────────────────────────────────────────────────
-# 7. reset() 완전 초기화 검증
+# 6. reset() 완전 초기화 검증
 # ─────────────────────────────────────────────────────────────────
 class TestReset:
     def test_reset_clears_all(self):

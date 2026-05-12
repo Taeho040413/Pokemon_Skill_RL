@@ -47,6 +47,7 @@ import wandb
 from pokemonred_puffer import cleanrl_puffer
 from pokemonred_puffer.cleanrl_puffer import CleanPuffeRL
 from pokemonred_puffer.environment import RedGymEnv
+from pokemonred_puffer.rewards.reward_machine import HMTarget
 from pokemonred_puffer.wrappers.async_io import AsyncWrapper
 from pokemonred_puffer.wrappers.sqlite import SqliteStateResetWrapper
 
@@ -75,6 +76,10 @@ def make_policy(env: RedGymEnv, policy_name: str, config: DictConfig) -> nn.Modu
     policy = policy_class(env, **config.policies[policy_name].policy)
     if config.train.use_rnn:
         rnn_config = config.policies[policy_name].rnn
+        if policy_name == "multi_convolutional.MultiConvolutionalPolicy":
+            expected_input_size = int(config.policies[policy_name].policy.hidden_size) + len(HMTarget)
+            with open_dict(rnn_config.args):
+                rnn_config.args.input_size = expected_input_size
         policy_class = getattr(policy_module, rnn_config.name)
         policy = policy_class(env, policy, **rnn_config.args)
         policy = pufferlib.frameworks.cleanrl.RecurrentPolicy(policy)

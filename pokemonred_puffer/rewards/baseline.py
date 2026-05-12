@@ -6,7 +6,6 @@ from pokemonred_puffer.environment import RedGymEnv
 from pokemonred_puffer.rewards.reward_machine import (
     CUTTABLE_TILES,
     HMTarget,
-    POKEFLUTE_TILE_IN_FRONT,
     RewardMachine,
     RewardMachineContext,
     RewardMachineState,
@@ -18,7 +17,6 @@ _RM_SUCCESS_KEYS = frozenset(
     {
         "rm_cut_success",
         "rm_surf_success",
-        "rm_pokeflute_success",
         "rm_flash_success",
     }
 )
@@ -28,17 +26,14 @@ _RM_NO_REWARD_KEYS = frozenset(
     {
         "rm_cut_detected",
         "rm_surf_detected",
-        "rm_pokeflute_detected",
         "rm_flash_detected",
         "rm_cut_done",
         "rm_surf_done",
-        "rm_pokeflute_done",
         "rm_flash_done",
         "rm_failed_timeout",
         # *_DETECTED → IDLE 탈출 전이: 에이전트가 트리거 타일에서 벗어날 때 발생.
         "rm_cut_aborted",
         "rm_surf_aborted",
-        "rm_pokeflute_aborted",
         "rm_flash_aborted",
         "rm_flash_left_dark",
     }
@@ -57,9 +52,6 @@ _HM_SUPERVISION_TRANSITION_TARGETS: dict[str, HMTarget] = {
     "rm_flash_menu_open": HMTarget.FLASH,
     "rm_flash_mon_selected": HMTarget.FLASH,
     "rm_flash_success": HMTarget.FLASH,
-    "rm_pokeflute_detected": HMTarget.POKEFLUTE,
-    "rm_pokeflute_bag_open": HMTarget.POKEFLUTE,
-    "rm_pokeflute_success": HMTarget.POKEFLUTE,
 }
 _HM_PERSISTENT_LATCH_STEPS = 8
 
@@ -102,8 +94,6 @@ def get_hm_needed_target(
         return HMTarget.SURF
     if context.can_use_surf and adjacent_water_count > 0:
         return HMTarget.SURF
-    if context.tile_in_front == POKEFLUTE_TILE_IN_FRONT and context.can_use_pokeflute:
-        return HMTarget.POKEFLUTE
     if context.in_dark_cave and context.can_use_flash:
         return HMTarget.FLASH
     return HMTarget.NONE
@@ -119,8 +109,6 @@ def should_clear_persistent_hm_supervision(
     if "rm_failed_timeout" in transition_keys:
         return True
     if latched_target == HMTarget.CUT:
-        return True
-    if latched_target == HMTarget.POKEFLUTE:
         return True
     if latched_target == HMTarget.FLASH:
         return (not context.in_dark_cave) or (not context.can_use_flash)
@@ -165,7 +153,6 @@ class BaselineRewardEnv(RedGymEnv):
         self.rm_success_count = 0
         self.rm_cut_success_count = 0
         self.rm_surf_success_count = 0
-        self.rm_pokeflute_success_count = 0
         self.rm_flash_success_count = 0
         self.rm_intermediate_paid_count = 0
         self.rm_reward_from_success = 0.0
@@ -191,7 +178,6 @@ class BaselineRewardEnv(RedGymEnv):
         self.rm_success_count = 0
         self.rm_cut_success_count = 0
         self.rm_surf_success_count = 0
-        self.rm_pokeflute_success_count = 0
         self.rm_flash_success_count = 0
         self.rm_intermediate_paid_count = 0
         self.rm_reward_from_success = 0.0
@@ -281,8 +267,6 @@ class BaselineRewardEnv(RedGymEnv):
                     self.rm_cut_success_count += 1
                 elif step.transition_key == "rm_surf_success":
                     self.rm_surf_success_count += 1
-                elif step.transition_key == "rm_pokeflute_success":
-                    self.rm_pokeflute_success_count += 1
                 elif step.transition_key == "rm_flash_success":
                     self.rm_flash_success_count += 1
             elif amt > 0.0:

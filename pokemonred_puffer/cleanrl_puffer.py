@@ -92,7 +92,6 @@ def _wandb_environment_metrics(stats: dict) -> dict:
             "stats/rm_success_count",
             "stats/rm_cut_success_count",
             "stats/rm_surf_success_count",
-            "stats/rm_pokeflute_success_count",
             "stats/rm_flash_success_count",
             "stats/rm_intermediate_paid_count",
             "stats/rm_reward_from_success",
@@ -127,7 +126,6 @@ _CORE_STAT_KEYS = {
     "stats/rm_success_count",
     "stats/rm_cut_success_count",
     "stats/rm_surf_success_count",
-    "stats/rm_pokeflute_success_count",
     "stats/rm_flash_success_count",
     "stats/rm_intermediate_paid_count",
     "stats/rm_reward_from_success",
@@ -809,7 +807,7 @@ class CleanPuffeRL:
                     # buffer, not a dict. The policy's `encode_observations`
                     # nativizes it internally and stashes both `last_hm_logits`
                     # and `last_hm_target` so the auxiliary CE loss can be
-                    # computed against the reward-machine target.
+                    # computed against the current HM supervision target.
                     hm_logits = get_policy_attr(self.policy, "last_hm_logits")
                     hm_target = get_policy_attr(self.policy, "last_hm_target")
                     if (
