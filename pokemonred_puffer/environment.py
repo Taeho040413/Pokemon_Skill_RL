@@ -1,6 +1,8 @@
 import io
+import json
 import os
 import random
+import time
 import uuid
 from abc import abstractmethod
 from collections import deque
@@ -54,10 +56,12 @@ from pokemonred_puffer.rewards.reward_machine import (
     DARK_CAVE_MAP_PAL_OFFSET,
     HMTarget,
     RewardMachineState,
+    SURF_TILE_IN_FRONT,
 )
 
 PIXEL_VALUES = np.array([0, 85, 153, 255], dtype=np.uint8)
 VISITED_MASK_SHAPE = (144 // 16, 160 // 16, 1)
+HM_SCREEN_CROP_SHAPE = (48, 48, 1)
 
 
 VALID_ACTIONS = [
@@ -81,6 +85,28 @@ VALID_RELEASE_ACTIONS = [
 ]
 
 VALID_ACTIONS_STR = ["down", "left", "right", "up", "a", "b", "start"]
+DEBUG_LOG_PATH = "/home/pnudtn06/yuntaeho/poke_skills/.cursor/debug-d00070.log"
+DEBUG_SESSION_ID = "d00070"
+DEBUG_RUN_ID = "pre-fix"
+
+
+def _append_debug_log(
+    hypothesis_id: str, location: str, message: str, data: dict[str, Any]
+) -> None:
+    try:
+        payload = {
+            "sessionId": DEBUG_SESSION_ID,
+            "runId": DEBUG_RUN_ID,
+            "hypothesisId": hypothesis_id,
+            "location": location,
+            "message": message,
+            "data": data,
+            "timestamp": int(time.time() * 1000),
+        }
+        with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as debug_log_file:
+            debug_log_file.write(json.dumps(payload, default=str) + "\n")
+    except OSError:
+        pass
 
 ACTION_SPACE = spaces.Discrete(len(VALID_ACTIONS))
 
@@ -229,8 +255,17 @@ class RedGymEnv(Env):
                 low=0, high=len(RewardMachineState) - 1, shape=(1,), dtype=np.uint8
             ),
             "hm_target": spaces.Box(low=0, high=len(HMTarget) - 1, shape=(1,), dtype=np.uint8),
+            "hm_supervision_target": spaces.Box(
+                low=0, high=len(HMTarget) - 1, shape=(1,), dtype=np.uint8
+            ),
+            # HM head 전용 고해상도 로컬 시야. 전체 screen보다 덜 압축된 플레이어 주변 패턴을 준다.
+            "hm_screen": spaces.Box(
+                low=0, high=255, shape=HM_SCREEN_CROP_SHAPE, dtype=np.uint8
+            ),
             # wTileInFrontOfPlayer — RM·컷/서핑 훅과 동일 기준으로 필드 HM 판단에 쓰임.
             "tile_in_front": spaces.Box(low=0, high=255, shape=(1,), dtype=np.uint8),
+            # 4방향 인접 타일 블록 중 물 타일이 보이는 방향 수. Surf 힌트용 보조 feature.
+            "adjacent_water_count": spaces.Box(low=0, high=4, shape=(1,), dtype=np.uint8),
         }
         if not self.skip_safari_zone:
             obs_dict["safari_steps"] = spaces.Box(low=0, high=502.0, shape=(1,), dtype=np.uint32)
@@ -422,6 +457,12 @@ class RedGymEnv(Env):
         self.current_event_flags_set = {}
 
         self.action_hist = np.zeros(len(VALID_ACTIONS))
+        self._debug_prev_coords = self.get_game_coords()
+        self._debug_stationary_steps = 0
+        self._debug_logged_stationary = False
+        self._debug_last_action = None
+        self._debug_same_action_streak = 0
+        self._debug_last_joy_ignore_loops = 0
 
         self.max_map_progress = 0
         self.progress_reward = self.get_game_state_reward()
@@ -510,9 +551,38 @@ class RedGymEnv(Env):
     def render(self) -> npt.NDArray[np.uint8]:
         return self.screen.ndarray[:, :, 1]
 
+    def _extract_hm_screen_crop(
+        self, frame: npt.NDArray[np.uint8], center_y: int | None = None, center_x: int | None = None
+    ) -> npt.NDArray[np.uint8]:
+        crop_h, crop_w, _ = HM_SCREEN_CROP_SHAPE
+        center_y = frame.shape[0] // 2 if center_y is None else center_y
+        center_x = frame.shape[1] // 2 if center_x is None else center_x
+        start_y = center_y - crop_h // 2
+        start_x = center_x - crop_w // 2
+        end_y = start_y + crop_h
+        end_x = start_x + crop_w
+
+        pad_top = max(0, -start_y)
+        pad_left = max(0, -start_x)
+        pad_bottom = max(0, end_y - frame.shape[0])
+        pad_right = max(0, end_x - frame.shape[1])
+        if pad_top or pad_left or pad_bottom or pad_right:
+            frame = np.pad(
+                frame,
+                ((pad_top, pad_bottom), (pad_left, pad_right), (0, 0)),
+                mode="edge",
+            )
+            start_y += pad_top
+            end_y += pad_top
+            start_x += pad_left
+            end_x += pad_left
+        return frame[start_y:end_y, start_x:end_x, :].astype(np.uint8, copy=False)
+
     def screen_obs(self):
         # (144, 160, 3)
-        game_pixels_render = np.expand_dims(self.screen.ndarray[:, :, 1], axis=-1)
+        raw_screen = np.expand_dims(self.screen.ndarray[:, :, 1], axis=-1)
+        hm_screen = self._extract_hm_screen_crop(raw_screen)
+        game_pixels_render = raw_screen
 
         if self.reduce_res:
             game_pixels_render = game_pixels_render[::2, ::2, :]
@@ -669,6 +739,7 @@ class RedGymEnv(Env):
         return {
             "screen": game_pixels_render,
             "visited_mask": visited_mask,
+            "hm_screen": hm_screen,
         } | ({"global_map": global_map} if self.use_global_map else {})
 
     def _get_obs(self):
@@ -708,8 +779,14 @@ class RedGymEnv(Env):
                 "lapras": np.array(self.flags.get_bit("BIT_GOT_LAPRAS"), np.uint8),  # got lapras
                 "rm_state": np.array([self.get_reward_machine_state_id()], dtype=np.uint8),
                 "hm_target": np.array([self.get_reward_machine_hm_target_id()], dtype=np.uint8),
+                "hm_supervision_target": np.array(
+                    [self.get_hm_supervision_target_id()], dtype=np.uint8
+                ),
                 "tile_in_front": np.array(
                     [self.get_tile_in_front_of_player()], dtype=np.uint8
+                ),
+                "adjacent_water_count": np.array(
+                    [self.get_adjacent_water_count()], dtype=np.uint8
                 ),
             }
             | (
@@ -783,6 +860,57 @@ class RedGymEnv(Env):
         new_reward = self.update_reward()
         self.last_health = self.read_hp_fraction()
         self.update_map_progress()
+        current_coords = self.get_game_coords()
+        if self._debug_last_action == int(action):
+            self._debug_same_action_streak += 1
+        else:
+            self._debug_same_action_streak = 1
+        self._debug_last_action = int(action)
+        if current_coords == self._debug_prev_coords:
+            self._debug_stationary_steps += 1
+        else:
+            self._debug_stationary_steps = 0
+            self._debug_logged_stationary = False
+        if self._debug_stationary_steps >= 64 and not self._debug_logged_stationary:
+            # region agent log
+            _append_debug_log(
+                "H1",
+                "pokemonred_puffer/environment.py:step",
+                "stationary movement streak",
+                {
+                    "step_count": int(self.step_count),
+                    "coords": tuple(int(v) for v in current_coords),
+                    "action": VALID_ACTIONS_STR[int(action)],
+                    "same_action_streak": int(self._debug_same_action_streak),
+                    "stationary_steps": int(self._debug_stationary_steps),
+                    "tile_in_front": int(self.get_tile_in_front_of_player()),
+                    "use_surf": int(self.use_surf),
+                    "reward_sum": float(sum(self.progress_reward.values())),
+                },
+            )
+            # endregion
+            # region agent log
+            _append_debug_log(
+                "H2,H3",
+                "pokemonred_puffer/environment.py:step",
+                "stationary control state",
+                {
+                    "step_count": int(self.step_count),
+                    "coords": tuple(int(v) for v in current_coords),
+                    "joy_ignore_loops": int(self._debug_last_joy_ignore_loops),
+                    "seen_start_menu": int(self.seen_start_menu),
+                    "seen_pokemon_menu": int(self.seen_pokemon_menu),
+                    "seen_bag_menu": int(self.seen_bag_menu),
+                    "seen_stats_menu": int(self.seen_stats_menu),
+                    "seen_action_bag_menu": int(self.seen_action_bag_menu),
+                    "rm_state": int(self.get_reward_machine_state_id()),
+                    "hm_target": int(self.get_reward_machine_hm_target_id()),
+                    "hm_supervision_target": int(self.get_hm_supervision_target_id()),
+                },
+            )
+            # endregion
+            self._debug_logged_stationary = True
+        self._debug_prev_coords = current_coords
         if self.perfect_ivs:
             self.set_perfect_iv_dvs()
         self.taught_cut = self.check_if_party_has_hm(TmHmMoves.CUT.value)
@@ -839,7 +967,23 @@ class RedGymEnv(Env):
             self.first = True
 
         if self.save_video:
-            self.add_video_frame()
+            try:
+                self.add_video_frame()
+            except Exception as exc:
+                # region agent log
+                _append_debug_log(
+                    "H4",
+                    "pokemonred_puffer/environment.py:step",
+                    "video writer failure",
+                    {
+                        "step_count": int(self.step_count),
+                        "coords": tuple(int(v) for v in self.get_game_coords()),
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                    },
+                )
+                # endregion
+                raise
 
         return obs, new_reward, reset, False, info
 
@@ -863,11 +1007,14 @@ class RedGymEnv(Env):
         self.update_seen_coords()
 
         # DO NOT DELETE. Some animations require dialog navigation
+        joy_ignore_loops = 0
         for _ in range(1000):
             if not self.read_m("wJoyIgnore"):
                 break
+            joy_ignore_loops += 1
             self.pyboy.button("a", 8)
             self.pyboy.tick(self.action_freq, render=False)
+        self._debug_last_joy_ignore_loops = joy_ignore_loops
 
         if self.events.get_event("EVENT_GOT_HM01"):
             if self.auto_use_cut:
@@ -1121,99 +1268,61 @@ class RedGymEnv(Env):
                 WindowEvent.PRESS_ARROW_UP,
             ]
         ):
-            in_overworld = self.read_m("wCurMapTileset") == Tilesets.OVERWORLD.value
-            in_plateau = self.read_m("wCurMapTileset") == Tilesets.PLATEAU.value
-            in_cavern = self.read_m("wCurMapTileset") == Tilesets.CAVERN.value
-            if (
-                in_overworld
-                or in_plateau
-                or (in_cavern and self.get_game_coords() in SEAFOAM_SURF_SPOTS)
-            ):
-                _, wTileMap = self.pyboy.symbol_lookup("wTileMap")
-                tileMap = self.pyboy.memory[wTileMap : wTileMap + 20 * 18]
-                tileMap = np.array(tileMap, dtype=np.uint8)
-                tileMap = np.reshape(tileMap, (18, 20))
-                y, x = 8, 8
-                # This could be made a little faster by only checking the
-                # direction that matters, but I decided to copy pasta the cut routine
-                up, down, left, right = (
-                    tileMap[y - 2 : y, x : x + 2],  # up
-                    tileMap[y + 2 : y + 4, x : x + 2],  # down
-                    tileMap[y : y + 2, x - 2 : x],  # left
-                    tileMap[y : y + 2, x + 2 : x + 4],  # right
-                )
+            if not self._action_points_to_adjacent_water(action):
+                return
 
-                # down, up, left, right
-                direction = self.read_m("wSpritePlayerStateData1FacingDirection")
+            # open start menu
+            self.pyboy.send_input(WindowEvent.PRESS_BUTTON_START)
+            self.pyboy.send_input(WindowEvent.RELEASE_BUTTON_START, delay=8)
+            self.pyboy.tick(self.action_freq, self.animate_scripts)
+            # scroll to pokemon
+            # 1 is the item index for pokemon
+            for _ in range(24):
+                if self.pyboy.memory[self.pyboy.symbol_lookup("wCurrentMenuItem")[1]] == 1:
+                    break
+                self.pyboy.send_input(WindowEvent.PRESS_ARROW_DOWN)
+                self.pyboy.send_input(WindowEvent.RELEASE_ARROW_DOWN, delay=8)
+                self.pyboy.tick(self.action_freq, self.animate_scripts)
+            self.pyboy.send_input(WindowEvent.PRESS_BUTTON_A)
+            self.pyboy.send_input(WindowEvent.RELEASE_BUTTON_A, delay=8)
+            self.pyboy.tick(self.action_freq, self.animate_scripts)
 
-                if not (
-                    (direction == 0x4 and action == WindowEvent.PRESS_ARROW_UP and 0x14 in up)
-                    or (
-                        direction == 0x0 and action == WindowEvent.PRESS_ARROW_DOWN and 0x14 in down
-                    )
-                    or (
-                        direction == 0x8 and action == WindowEvent.PRESS_ARROW_LEFT and 0x14 in left
-                    )
-                    or (
-                        direction == 0xC
-                        and action == WindowEvent.PRESS_ARROW_RIGHT
-                        and 0x14 in right
-                    )
+            # find pokemon with surf
+            # We run this over all pokemon so we dont end up in an infinite for loop
+            for _ in range(7):
+                self.pyboy.send_input(WindowEvent.PRESS_ARROW_DOWN)
+                self.pyboy.send_input(WindowEvent.RELEASE_ARROW_DOWN, delay=8)
+                self.pyboy.tick(self.action_freq, self.animate_scripts)
+                party_mon = self.pyboy.memory[self.pyboy.symbol_lookup("wCurrentMenuItem")[1]]
+                _, addr = self.pyboy.symbol_lookup(f"wPartyMon{party_mon%6+1}Moves")
+                if 0x39 in self.pyboy.memory[addr : addr + 4]:
+                    break
+
+            # Enter submenu
+            self.pyboy.send_input(WindowEvent.PRESS_BUTTON_A)
+            self.pyboy.send_input(WindowEvent.RELEASE_BUTTON_A, delay=8)
+            self.pyboy.tick(4 * self.action_freq, self.animate_scripts)
+
+            # Scroll until the field move is found
+            _, wFieldMoves = self.pyboy.symbol_lookup("wFieldMoves")
+            field_moves = self.pyboy.memory[wFieldMoves : wFieldMoves + 4]
+
+            for _ in range(10):
+                current_item = self.read_m("wCurrentMenuItem")
+                if current_item < 4 and field_moves[current_item] in (
+                    FieldMoves.SURF.value,
+                    FieldMoves.SURF_2.value,
                 ):
-                    return
-
-                # open start menu
-                self.pyboy.send_input(WindowEvent.PRESS_BUTTON_START)
-                self.pyboy.send_input(WindowEvent.RELEASE_BUTTON_START, delay=8)
-                self.pyboy.tick(self.action_freq, self.animate_scripts)
-                # scroll to pokemon
-                # 1 is the item index for pokemon
-                for _ in range(24):
-                    if self.pyboy.memory[self.pyboy.symbol_lookup("wCurrentMenuItem")[1]] == 1:
-                        break
-                    self.pyboy.send_input(WindowEvent.PRESS_ARROW_DOWN)
-                    self.pyboy.send_input(WindowEvent.RELEASE_ARROW_DOWN, delay=8)
-                    self.pyboy.tick(self.action_freq, self.animate_scripts)
-                self.pyboy.send_input(WindowEvent.PRESS_BUTTON_A)
-                self.pyboy.send_input(WindowEvent.RELEASE_BUTTON_A, delay=8)
+                    break
+                self.pyboy.send_input(WindowEvent.PRESS_ARROW_DOWN)
+                self.pyboy.send_input(WindowEvent.RELEASE_ARROW_DOWN, delay=8)
                 self.pyboy.tick(self.action_freq, self.animate_scripts)
 
-                # find pokemon with surf
-                # We run this over all pokemon so we dont end up in an infinite for loop
-                for _ in range(7):
-                    self.pyboy.send_input(WindowEvent.PRESS_ARROW_DOWN)
-                    self.pyboy.send_input(WindowEvent.RELEASE_ARROW_DOWN, delay=8)
-                    self.pyboy.tick(self.action_freq, self.animate_scripts)
-                    party_mon = self.pyboy.memory[self.pyboy.symbol_lookup("wCurrentMenuItem")[1]]
-                    _, addr = self.pyboy.symbol_lookup(f"wPartyMon{party_mon%6+1}Moves")
-                    if 0x39 in self.pyboy.memory[addr : addr + 4]:
-                        break
-
-                # Enter submenu
+            # press a bunch of times
+            for _ in range(5):
                 self.pyboy.send_input(WindowEvent.PRESS_BUTTON_A)
                 self.pyboy.send_input(WindowEvent.RELEASE_BUTTON_A, delay=8)
                 self.pyboy.tick(4 * self.action_freq, self.animate_scripts)
-
-                # Scroll until the field move is found
-                _, wFieldMoves = self.pyboy.symbol_lookup("wFieldMoves")
-                field_moves = self.pyboy.memory[wFieldMoves : wFieldMoves + 4]
-
-                for _ in range(10):
-                    current_item = self.read_m("wCurrentMenuItem")
-                    if current_item < 4 and field_moves[current_item] in (
-                        FieldMoves.SURF.value,
-                        FieldMoves.SURF_2.value,
-                    ):
-                        break
-                    self.pyboy.send_input(WindowEvent.PRESS_ARROW_DOWN)
-                    self.pyboy.send_input(WindowEvent.RELEASE_ARROW_DOWN, delay=8)
-                    self.pyboy.tick(self.action_freq, self.animate_scripts)
-
-                # press a bunch of times
-                for _ in range(5):
-                    self.pyboy.send_input(WindowEvent.PRESS_BUTTON_A)
-                    self.pyboy.send_input(WindowEvent.RELEASE_BUTTON_A, delay=8)
-                    self.pyboy.tick(4 * self.action_freq, self.animate_scripts)
 
     def solve_strength_puzzle(self):
         in_cavern = self.read_m("wCurMapTileset") == Tilesets.CAVERN.value
@@ -1497,16 +1606,17 @@ class RedGymEnv(Env):
         self.surf_tiles[wTileInFrontOfPlayer] = 1
 
     def flash_hook(self, *args, **kwargs):
-        """StartMenu_Pokemon.flash 진입 시점: Flash를 한번이라도 사용했음을 기록한다.
+        """Record Flash usage.
 
-        기존에는 wMapPalOffset == DARK_CAVE_MAP_PAL_OFFSET(동굴 팔레트)에서만
-        valid_flash_coords로 카운트했지만, 이제는 "어두운 화면에서 Flash를 썼고
-        그 후 화면이 밝아지는지"를 RewardMachine 쪽에서 팔레트 기반으로 판정한다.
-        여기서는 위치/타일과 무관하게 Flash 사용 사건만 valid로 센다.
+        Dark-cave uses count as valid attempts for the reward machine cycle.
+        Bright-area uses count as invalid HM usage so `unnecessary_hm_usage_penalty`
+        can discourage wasting Flash outside caves.
         """
         player_direction = self.pyboy.memory[
             self.pyboy.symbol_lookup("wSpritePlayerStateData1FacingDirection")[1]
         ]
+        _, wMapPalOffset = self.pyboy.symbol_lookup("wMapPalOffset")
+        in_dark_cave = self.pyboy.memory[wMapPalOffset] == DARK_CAVE_MAP_PAL_OFFSET
         x, y, map_id = self.get_game_coords()
         if player_direction == 0:
             coords = (x, y + 1, map_id)
@@ -1516,8 +1626,10 @@ class RedGymEnv(Env):
             coords = (x - 1, y, map_id)
         if player_direction == 0xC:
             coords = (x + 1, y, map_id)
-        # 타일/팔레트 상관없이 Flash 사용을 성공 시도(valid)로 기록한다.
-        self.valid_flash_coords[coords] = 1
+        if in_dark_cave:
+            self.valid_flash_coords[coords] = 1
+        else:
+            self.invalid_flash_coords[coords] = 1
         w_tile = self.pyboy.memory[self.pyboy.symbol_lookup("wTileInFrontOfPlayer")[1]]
         self.flash_tiles[w_tile] = 1
 
@@ -1593,6 +1705,7 @@ class RedGymEnv(Env):
                 "invalid_flash_coords": len(self.invalid_flash_coords),
                 "rm_state": self.get_reward_machine_state_id(),
                 "hm_target": self.get_reward_machine_hm_target_id(),
+                "hm_supervision_target": self.get_hm_supervision_target_id(),
                 "rm_transition_count": getattr(self, "rm_transition_count", 0),
                 "rm_reward_total": getattr(self, "rm_reward_total", 0.0),
                 "rm_success_count": getattr(self, "rm_success_count", 0),
@@ -1726,6 +1839,59 @@ class RedGymEnv(Env):
         _, addr = self.pyboy.symbol_lookup("wTileInFrontOfPlayer")
         return int(self.pyboy.memory[addr])
 
+    def _supports_surf_tile_scan(self) -> bool:
+        tileset = self.read_m("wCurMapTileset")
+        in_overworld = tileset == Tilesets.OVERWORLD.value
+        in_plateau = tileset == Tilesets.PLATEAU.value
+        in_cavern = tileset == Tilesets.CAVERN.value
+        return bool(in_overworld or in_plateau or (in_cavern and self.get_game_coords() in SEAFOAM_SURF_SPOTS))
+
+    def _get_adjacent_directional_tiles(self) -> dict[str, npt.NDArray[np.uint8]] | None:
+        if not self._supports_surf_tile_scan():
+            return None
+
+        _, wTileMap = self.pyboy.symbol_lookup("wTileMap")
+        tile_map = np.array(self.pyboy.memory[wTileMap : wTileMap + 20 * 18], dtype=np.uint8)
+        tile_map = np.reshape(tile_map, (18, 20))
+        y, x = 8, 8
+        return {
+            "up": tile_map[y - 2 : y, x : x + 2],
+            "down": tile_map[y + 2 : y + 4, x : x + 2],
+            "left": tile_map[y : y + 2, x - 2 : x],
+            "right": tile_map[y : y + 2, x + 2 : x + 4],
+        }
+
+    def get_adjacent_water_count(self) -> int:
+        directional_tiles = self._get_adjacent_directional_tiles()
+        if directional_tiles is None:
+            return 0
+        return sum(int(SURF_TILE_IN_FRONT in tiles) for tiles in directional_tiles.values())
+
+    def _action_points_to_adjacent_water(self, action: WindowEvent) -> bool:
+        directional_tiles = self._get_adjacent_directional_tiles()
+        if directional_tiles is None:
+            return False
+
+        direction = self.read_m("wSpritePlayerStateData1FacingDirection")
+        return bool(
+            (direction == 0x4 and action == WindowEvent.PRESS_ARROW_UP and SURF_TILE_IN_FRONT in directional_tiles["up"])
+            or (
+                direction == 0x0
+                and action == WindowEvent.PRESS_ARROW_DOWN
+                and SURF_TILE_IN_FRONT in directional_tiles["down"]
+            )
+            or (
+                direction == 0x8
+                and action == WindowEvent.PRESS_ARROW_LEFT
+                and SURF_TILE_IN_FRONT in directional_tiles["left"]
+            )
+            or (
+                direction == 0xC
+                and action == WindowEvent.PRESS_ARROW_RIGHT
+                and SURF_TILE_IN_FRONT in directional_tiles["right"]
+            )
+        )
+
     def get_map_pal_offset(self) -> int:
         _, addr = self.pyboy.symbol_lookup("wMapPalOffset")
         return int(self.pyboy.memory[addr])
@@ -1851,6 +2017,12 @@ class RedGymEnv(Env):
         if reward_machine is None:
             return int(HMTarget.NONE)
         return int(reward_machine.hm_target)
+
+    def get_hm_supervision_target_id(self) -> int:
+        hm_supervision_target = getattr(self, "hm_supervision_target", None)
+        if hm_supervision_target is not None:
+            return int(hm_supervision_target)
+        return self.get_reward_machine_hm_target_id()
 
     def update_max_op_level(self):
         # opp_base_level = 5

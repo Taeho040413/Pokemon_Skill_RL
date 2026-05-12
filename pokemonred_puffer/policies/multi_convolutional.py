@@ -12,6 +12,9 @@ from pokemonred_puffer.rewards.reward_machine import HMTarget, RewardMachineStat
 
 HM_ACTIONS = ("cut", "surf", "flash", "pokeflute", "none")
 HM_FEATURE_COUNT = len(HMTarget)
+HM_LOCAL_HINT_DIM = 2
+HM_LOCAL_HINT_HIDDEN_SIZE = 16
+HM_LOCAL_HINT_MAX_BIAS = 0.1
 
 
 # Because torch.nn.functional.one_hot cannot be traced by torch as of 2.2.0
@@ -56,6 +59,15 @@ class MultiConvolutionalPolicy(nn.Module):
             nn.ReLU(),
             nn.Flatten(),
         )
+        self.hm_screen_network = nn.Sequential(
+            nn.LazyConv2d(16, 5, stride=2),
+            nn.ReLU(),
+            nn.LazyConv2d(32, 3, stride=2),
+            nn.ReLU(),
+            nn.Flatten(),
+            nn.LazyLinear(128),
+            nn.ReLU(),
+        )
         # if channels_last:
         #     self.screen_network = self.screen_network.to(memory_format=torch.channels_last)
 
@@ -74,6 +86,11 @@ class MultiConvolutionalPolicy(nn.Module):
             nn.LazyLinear(hm_hidden_size),
             nn.ReLU(),
             nn.LazyLinear(HM_FEATURE_COUNT),
+        )
+        self.hm_hint_network = nn.Sequential(
+            nn.Linear(HM_LOCAL_HINT_DIM, HM_LOCAL_HINT_HIDDEN_SIZE),
+            nn.ReLU(),
+            nn.Linear(HM_LOCAL_HINT_HIDDEN_SIZE, HM_FEATURE_COUNT),
         )
         self.hm_feature_alpha = nn.Parameter(torch.tensor(hm_feature_alpha_init))
         # HM action bias는 학습 파라미터가 아니라 고정 상수로 유지합니다.
@@ -165,6 +182,22 @@ class MultiConvolutionalPolicy(nn.Module):
             len(RewardMachineState), rm_state_embedding_dim, dtype=torch.float32
         )
 
+    @staticmethod
+    def _feature_width(features: tuple[torch.Tensor, ...]) -> int:
+        return sum(int(feature.shape[-1]) for feature in features)
+
+    @staticmethod
+    def _expected_input_width(block: nn.Sequential) -> int | None:
+        first_layer = block[0]
+        has_uninitialized = getattr(first_layer, "has_uninitialized_params", None)
+        if callable(has_uninitialized) and has_uninitialized():
+            return None
+
+        weight = getattr(first_layer, "weight", None)
+        if weight is None:
+            return None
+        return int(weight.shape[1])
+
     def forward(self, observations):
         hidden, lookup = self.encode_observations(observations)
         actions, value = self.decode_actions(hidden, lookup)
@@ -227,6 +260,12 @@ class MultiConvolutionalPolicy(nn.Module):
         if self.downsample > 1:
             image_observation = image_observation[:, :, :: self.downsample, :: self.downsample]
 
+        hm_screen = observations.get("hm_screen")
+        if hm_screen is None:
+            hm_screen = screen
+        if self.channels_last:
+            hm_screen = hm_screen.permute(0, 3, 1, 2)
+
         # party network
         species = self.species_embeddings(observations["species"].int()).float().squeeze(1)
         status = one_hot(observations["status"].int(), 7).float().squeeze(1)
@@ -271,78 +310,100 @@ class MultiConvolutionalPolicy(nn.Module):
 
         rm_state = self.rm_state_embeddings(observations["rm_state"].int()).squeeze(1)
         screen_latent = self.screen_network(image_observation.float() / 255.0).squeeze(1)
+        hm_screen_latent = self.hm_screen_network(hm_screen.float() / 255.0)
+        tile_in_front = (observations["tile_in_front"].float() / 255.0).reshape(
+            observations["tile_in_front"].shape[0], -1
+        )
+        adjacent_water_count_obs = observations.get("adjacent_water_count")
+        if adjacent_water_count_obs is None:
+            adjacent_water_count = torch.zeros_like(tile_in_front)
+        else:
+            adjacent_water_count = (adjacent_water_count_obs.float() / 4.0).reshape(
+                adjacent_water_count_obs.shape[0], -1
+            )
+        hm_local_hint_features = torch.cat((tile_in_front, adjacent_water_count), dim=-1)
+        # Keep the old HM encoder width stable, but remove direct tile shortcuts
+        # from the main trunk so the classifier leans on screen/CNN features first.
+        hm_tile_placeholder = torch.zeros_like(tile_in_front)
+        hm_adjacent_placeholder = torch.zeros_like(adjacent_water_count)
 
-        cat_obs_hm = torch.cat(
-            (
-                screen_latent,
-                one_hot(observations["direction"].int(), 4).float().squeeze(1),
-                map_id.squeeze(1),
-                items.flatten(start_dim=1),
-                party_latent,
-                events_obs,
-                observations["game_corner_rocket"].float(),
-                observations["saffron_guard"].float(),
-                observations["lapras"].float(),
-                (observations["tile_in_front"].float() / 255.0).reshape(
-                    observations["tile_in_front"].shape[0], -1
+        hm_feature_prefix = (
+            screen_latent,
+            hm_screen_latent,
+            one_hot(observations["direction"].int(), 4).float().squeeze(1),
+            map_id.squeeze(1),
+            items.flatten(start_dim=1),
+            party_latent,
+            events_obs,
+            observations["game_corner_rocket"].float(),
+            observations["saffron_guard"].float(),
+            observations["lapras"].float(),
+            hm_tile_placeholder,
+        )
+        policy_feature_prefix = (
+            screen_latent,
+            one_hot(observations["direction"].int(), 4).float().squeeze(1),
+            map_id.squeeze(1),
+            items.flatten(start_dim=1),
+            party_latent,
+            events_obs,
+            rm_state,
+            observations["game_corner_rocket"].float(),
+            observations["saffron_guard"].float(),
+            observations["lapras"].float(),
+            tile_in_front,
+        )
+        shared_suffix = (
+            ()
+            if self.skip_safari_zone
+            else (
+                (observations["safari_steps"].float() / 502.0).reshape(
+                    observations["safari_steps"].shape[0], -1
                 ),
             )
-            + (
-                ()
-                if self.skip_safari_zone
-                else (
-                    (observations["safari_steps"].float() / 502.0).reshape(
-                        observations["safari_steps"].shape[0], -1
-                    ),
-                )
-            )
-            + (
-                (self.global_map_network(global_map.float() / 255.0).squeeze(1),)
-                if self.use_global_map
-                else ()
-            ),
+        ) + (
+            (self.global_map_network(global_map.float() / 255.0).squeeze(1),)
+            if self.use_global_map
+            else ()
+        )
+
+        hm_base_features = hm_feature_prefix + shared_suffix
+        policy_base_features = policy_feature_prefix + shared_suffix
+        hm_features = hm_base_features
+        policy_features = policy_base_features
+
+        hm_expected_width = self._expected_input_width(self.encode_linear_hm)
+        hm_new_width = self._feature_width(hm_base_features + (hm_adjacent_placeholder,))
+        hm_accepts_adjacent = hm_expected_width in (None, hm_new_width)
+
+        # Preserve the legacy HM trunk width for older checkpoints, but keep the
+        # actual local tile hints out of the main classifier input.
+        if hm_accepts_adjacent:
+            hm_features = hm_base_features + (hm_adjacent_placeholder,)
+
+        cat_obs_hm = torch.cat(
+            hm_features,
             dim=-1,
         )
         z_hm = self.encode_linear_hm(cat_obs_hm)
         hm_logits = self.hm_head(z_hm)
+        hm_hint_network = getattr(self, "hm_hint_network", None)
+        if hm_hint_network is not None:
+            hm_hint_logits = HM_LOCAL_HINT_MAX_BIAS * torch.tanh(
+                hm_hint_network(hm_local_hint_features.to(hm_logits.dtype))
+            )
+            hm_logits = hm_logits + hm_hint_logits
         hm_probs = torch.softmax(hm_logits, dim=-1)
         self.last_hm_logits = hm_logits
         self.last_hm_probs = hm_probs
-        # Stash hm_target from the observation dict so the PPO loss path (which
-        # only sees the flat tensor) can supervise hm_logits via CE.
-        self.last_hm_target = observations["hm_target"].long().reshape(-1)
+        # Stash the HM supervision target from the observation dict so the PPO
+        # loss path (which only sees the flat tensor) can supervise hm_logits via CE.
+        hm_supervision_target = observations.get("hm_supervision_target", observations["hm_target"])
+        self.last_hm_target = hm_supervision_target.long().reshape(-1)
 
         # actor/value는 rm_state를 포함해서 학습합니다.
         cat_obs_policy = torch.cat(
-            (
-                screen_latent,
-                one_hot(observations["direction"].int(), 4).float().squeeze(1),
-                map_id.squeeze(1),
-                items.flatten(start_dim=1),
-                party_latent,
-                events_obs,
-                rm_state,
-                observations["game_corner_rocket"].float(),
-                observations["saffron_guard"].float(),
-                observations["lapras"].float(),
-                (observations["tile_in_front"].float() / 255.0).reshape(
-                    observations["tile_in_front"].shape[0], -1
-                ),
-            )
-            + (
-                ()
-                if self.skip_safari_zone
-                else (
-                    (observations["safari_steps"].float() / 502.0).reshape(
-                        observations["safari_steps"].shape[0], -1
-                    ),
-                )
-            )
-            + (
-                (self.global_map_network(global_map.float() / 255.0).squeeze(1),)
-                if self.use_global_map
-                else ()
-            ),
+            policy_features,
             dim=-1,
         )
         z_policy = self.encode_linear_policy(cat_obs_policy)

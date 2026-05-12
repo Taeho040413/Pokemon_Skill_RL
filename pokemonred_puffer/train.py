@@ -15,6 +15,7 @@ from types import ModuleType
 from typing import Annotated, Any, Callable
 
 import gymnasium
+import numpy as np
 import pufferlib
 import pufferlib.emulation
 import pufferlib.vector
@@ -22,6 +23,7 @@ import typer
 from omegaconf import DictConfig, OmegaConf, open_dict
 import torch
 from torch import nn
+from torch.nn.parameter import UninitializedBuffer, UninitializedParameter
 
 # torch.compile / Inductor: harmless upstream noise during graph compile.
 warnings.filterwarnings(
@@ -54,7 +56,7 @@ DEFAULT_CONFIG = "config.yaml"
 DEFAULT_POLICY = "multi_convolutional.MultiConvolutionalPolicy"
 DEFAULT_REWARD = "baseline.ObjectRewardRequiredEventsMapIdsFieldMoves"
 DEFAULT_WRAPPER = "baseline"
-DEFAULT_ROM = "train_teach_skill.gb"
+DEFAULT_ROM = "training3.gb"
 # Default run folder: runs/<DEFAULT_EXP_ID>/ (model_*.pt, trainer_state.pt). Override with --exp-name / -e.
 DEFAULT_EXP_ID = "pokeSkill001"
 
@@ -376,6 +378,79 @@ def _torch_load_module_checkpoint(path: str | Path, map_location: str | torch.de
         return torch.load(path, map_location=map_location)
 
 
+def _is_uninitialized_state_entry(entry: Any) -> bool:
+    return isinstance(entry, (UninitializedParameter, UninitializedBuffer))
+
+
+def _shape_tuple(entry: Any) -> tuple[int, ...] | None:
+    if _is_uninitialized_state_entry(entry):
+        return None
+    shape = getattr(entry, "shape", None)
+    if shape is None:
+        return None
+    return tuple(int(dim) for dim in shape)
+
+
+def _load_checkpoint_weights_into_fresh_policy(
+    fresh_policy: nn.Module, checkpoint_policy: nn.Module
+) -> dict[str, Any]:
+    source_state = checkpoint_policy.state_dict()
+    target_state = fresh_policy.state_dict()
+    compatible_state: dict[str, Any] = {}
+    skipped_missing: list[str] = []
+    skipped_shape: list[str] = []
+
+    for key, source_value in source_state.items():
+        target_value = target_state.get(key)
+        if target_value is None:
+            skipped_missing.append(key)
+            continue
+
+        target_shape = _shape_tuple(target_value)
+        source_shape = _shape_tuple(source_value)
+        if target_shape is not None and source_shape is not None and target_shape != source_shape:
+            skipped_shape.append(f"{key}: checkpoint{source_shape} != fresh{target_shape}")
+            continue
+
+        compatible_state[key] = source_value
+
+    load_result = fresh_policy.load_state_dict(compatible_state, strict=False)
+    return {
+        "loaded_key_count": len(compatible_state),
+        "skipped_missing_count": len(skipped_missing),
+        "skipped_shape_count": len(skipped_shape),
+        "missing_keys": list(load_result.missing_keys),
+        "unexpected_keys": list(load_result.unexpected_keys),
+        "skipped_missing_preview": skipped_missing[:12],
+        "skipped_shape_preview": skipped_shape[:12],
+    }
+
+
+def _materialize_lazy_policy_modules(
+    policy: nn.Module, driver_env: Any, device: str | torch.device
+) -> None:
+    """Initialize Lazy* layers against the live observation shape before checkpoint migration."""
+    observation_space = getattr(driver_env, "single_observation_space", None)
+    observation_shape = getattr(observation_space, "shape", None)
+    if observation_shape is None:
+        return
+
+    observation_dtype = getattr(observation_space, "dtype", np.float32)
+    sample_obs = np.zeros((1, *observation_shape), dtype=observation_dtype)
+    sample_obs_tensor = torch.from_numpy(sample_obs).to(device)
+
+    was_training = policy.training
+    try:
+        policy.eval()
+        with torch.no_grad():
+            if hasattr(policy, "lstm"):
+                policy(sample_obs_tensor, None)
+            else:
+                policy(sample_obs_tensor)
+    finally:
+        policy.train(was_training)
+
+
 def _report_policy_checkpoint(run_dir: Path, detail: str) -> None:
     """W&B / Rich often hide stdout; stderr + a small file in the run dir stay inspectable."""
     stamp = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
@@ -482,7 +557,7 @@ def _apply_rollout_display_config(config: DictConfig, headless: bool) -> None:
 
 
 def load_latest_policy_if_available(
-    policy: nn.Module, config: DictConfig
+    policy: nn.Module, config: DictConfig, driver_env: Any | None = None
 ) -> tuple[nn.Module, dict[str, Any]]:
     run_dir = Path(config.train.data_dir) / config.train.exp_id
     latest_model_path = find_latest_model_path(config.train.data_dir, config.train.exp_id)
@@ -513,18 +588,38 @@ def load_latest_policy_if_available(
     base_info["model_path"] = str(latest_model_path.resolve())
     base_info["model_file"] = latest_model_path.name
     try:
-        loaded_policy = _torch_load_module_checkpoint(
+        if driver_env is not None:
+            _materialize_lazy_policy_modules(policy, driver_env, config.train.device)
+        checkpoint_policy = _torch_load_module_checkpoint(
             latest_model_path, config.train.device
         )
-        loaded_policy = loaded_policy.to(config.train.device)
+        checkpoint_policy = checkpoint_policy.to(config.train.device)
+        live_rnn = cleanrl_puffer._rollout_recurrent_core(policy)
+        saved_rnn = cleanrl_puffer._rollout_recurrent_core(checkpoint_policy)
+        live_obs_shape = tuple(live_rnn.obs_shape) if live_rnn is not None else None
+        saved_obs_shape = tuple(saved_rnn.obs_shape) if saved_rnn is not None else None
+        load_summary = _load_checkpoint_weights_into_fresh_policy(policy, checkpoint_policy)
+        loaded_policy = policy
         base_info["status"] = "loaded"
+        base_info["load_summary"] = load_summary
         _report_policy_checkpoint(
             run_dir,
             "\n".join(
                 [
                     f"Loaded OK: {latest_model_path.resolve()}",
                     f"exp_id={exp_id}",
-                    "Continuing training with these weights.",
+                    (
+                        "Metadata mismatch detected; migrated compatible checkpoint weights into a fresh policy."
+                        if saved_obs_shape is not None
+                        and live_obs_shape is not None
+                        and saved_obs_shape != live_obs_shape
+                        else "Migrated compatible checkpoint weights into a fresh policy."
+                    ),
+                    (
+                        f"loaded_keys={load_summary['loaded_key_count']} "
+                        f"skipped_shape={load_summary['skipped_shape_count']} "
+                        f"skipped_missing={load_summary['skipped_missing_count']}"
+                    ),
                 ]
             ),
         )
@@ -910,7 +1005,9 @@ def train(
             backend=vec,
         )
         policy = make_policy(vecenv.driver_env, policy_name, config)
-        policy, policy_ckpt_info = load_latest_policy_if_available(policy, config)
+        policy, policy_ckpt_info = load_latest_policy_if_available(
+            policy, config, vecenv.driver_env
+        )
 
         with init_wandb(
             config=config,

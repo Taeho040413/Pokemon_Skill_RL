@@ -13,11 +13,11 @@ env:
   # Directory with pyboy save states to load from.
   state_dir: pyboy_states
   # File within state dir to load from.
-  init_state: training2
+  init_state: training3
   # How many ticks each environment step should take.
   action_freq: 24
   # Maximum number of steps per mini-episode.
-  max_steps: 16000
+  max_steps: 20000
   # If true, save videos.
   save_video: True
   # If true, save sped up videos.
@@ -214,9 +214,15 @@ train:
   # items to the environments.
   required_rate: False
   # Auxiliary CE loss weight for hm_logits supervised by reward-machine hm_target.
-  hm_aux_loss_coef: 0.02
-  # HM 보조 CE 라벨 스무딩 (0이면 비활성). train 코드에서 cross_entropy에 전달.
-  hm_aux_label_smoothing: 0.05
+  hm_aux_loss_coef: 0.03
+  # IDLE(hm_target==NONE)에서 HM head가 CUT으로만 몰리지 않게: NONE CE를 비-NONE CE에 가산할 가중.
+  # 0이면 기존과 동일(NONE은 비-NONE CE에만 간접 반영). 0.15~0.3 정도부터 시도.
+  hm_none_ce_coef: 0.07
+  # HM aux CE 라벨 스무딩. >0이면 “정답 아닌 클래스”에 대칭으로 질량이 가서
+  # prob1~prob4가 비슷한 잔여값(대시보드에 ~0.01씩)으로 보이기 쉬움. 똑바로 갈리게 하려면 0 권장.
+  hm_aux_label_smoothing: 0.0
+  # HM head 엔트로피 보너스(균등에 가깝게). tail을 인위적으로 맞추므로 0 권장.
+  hm_head_entropy_coef: 0.0
 
 # Wrappers to use for training.
 # Each wrapper is keyed by a name for the commandline.
@@ -252,12 +258,14 @@ rewards:
   baseline.ObjectRewardRequiredEventsMapIdsFieldMoves:
     reward:
       rm_enabled: true
-      rm_transition: 0.0003
-      rm_cut_success: 3.0
-      rm_surf_success: 0.5
-      rm_flash_success: 4.0
+      rm_transition: 0.0001
+      rm_cut_success: 2.8
+      rm_surf_success: 1.5
+      rm_flash_success: 2.5
       rm_pokeflute_success: 4.0
-      step_penalty: 0.00015
+      step_penalty: 0.00022
+      # Cut/Surf 시도했으나 무효(맨땅·잘못된 타일 등): invalid_cut/surf 좌표 증가당 -계수.
+      unnecessary_hm_usage_penalty: 0.05
 
 
 # Policies to use for training.
@@ -287,7 +295,7 @@ policies:
 debug:
   env:
     headless: False
-    init_state: training2
+    init_state: training3
     state_dir: pyboy_states
     max_steps: 19000
     log_frequency: 1

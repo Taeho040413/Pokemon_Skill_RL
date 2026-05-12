@@ -41,8 +41,8 @@ from pokemonred_puffer.data.moves import Moves
 from pokemonred_puffer.data.species import Species
 from pokemonred_puffer.global_map import GLOBAL_MAP_SHAPE
 from pokemonred_puffer.profile import Profile, Utilization
-from pokemonred_puffer.wrappers.sqlite import SqliteStateResetWrapper
 from pokemonred_puffer.rewards.reward_machine import HMTarget
+from pokemonred_puffer.wrappers.sqlite import SqliteStateResetWrapper
 
 pyximport.install(setup_args={"include_dirs": [np.get_include()]})
 from pokemonred_puffer.c_gae import compute_gae  # type: ignore  # noqa: E402
@@ -77,7 +77,6 @@ def _safe_wandb_log_artifact(run, artifact: wandb.Artifact) -> None:
     except Exception as exc:
         print(f"[wandb] log_artifact failed (checkpoint already on disk): {exc}")
 
-
 def _wandb_environment_metrics(stats: dict) -> dict:
     """Subset of evaluate stats for W&B (skip exploration/badges/events menus, etc.)."""
     out: dict = {}
@@ -102,6 +101,7 @@ def _wandb_environment_metrics(stats: dict) -> dict:
             "stats/cut_count",
             "stats/rm_state",
             "stats/hm_target",
+            "stats/hm_supervision_target",
             "stats/last_action",
         ):
             out[f"environment/{k}"] = v
@@ -136,6 +136,7 @@ _CORE_STAT_KEYS = {
     "stats/cut_count",
     "stats/rm_state",
     "stats/hm_target",
+    "stats/hm_supervision_target",
     "stats/last_action",
 }
 _CORE_STAT_PREFIXES = ("policy/", "reward/", "stats/action_count/")
@@ -291,7 +292,12 @@ class Losses:
     hm_aux_loss: float = 0.0
     hm_accuracy: float = 0.0
     hm_non_none_frac: float = 0.0
+    # 배치 평균 HM softmax 엔트로피 (hm_head_entropy_coef>0일 때만 의미 있음).
+    hm_head_entropy: float = 0.0
+    # PPO update에서 epoch마다 누적 합(아래 주석). KL 조기 종료 시 epoch 수가 달라 스케일이 흔들림.
     entropy: float = 0.0
+    # entropy / 완료한 PPO epoch 수 → clipfrac·approx_kl와 동일하게 업데이트마다 비교 가능.
+    entropy_mean: float = 0.0
     old_approx_kl: float = 0.0
     approx_kl: float = 0.0
     clipfrac: float = 0.0
@@ -675,14 +681,24 @@ class CleanPuffeRL:
             hm_feature_alpha = get_policy_attr(self.policy, "hm_feature_alpha")
             hm_action_beta = get_policy_attr(self.policy, "hm_action_beta")
             hm_probs = get_policy_attr(self.policy, "last_hm_probs")
+            hm_target = get_policy_attr(self.policy, "last_hm_target")
             if hm_feature_alpha is not None:
                 self.stats["policy/hm_feature_alpha"] = hm_feature_alpha.detach().item()
             if hm_action_beta is not None:
                 self.stats["policy/hm_action_beta"] = hm_action_beta.detach().item()
             if hm_probs is not None:
-                mean_hm_probs = hm_probs.detach().float().mean(dim=0).cpu().numpy()
+                hm_probs_float = hm_probs.detach().float()
+                mean_hm_probs = hm_probs_float.mean(dim=0).cpu().numpy()
                 for idx, value in enumerate(mean_hm_probs):
                     self.stats[f"policy/hm_prob_{idx}"] = value
+                if hm_target is not None:
+                    hm_target_flat = hm_target.detach().reshape(-1).long()
+                    hm_mask = hm_target_flat != int(HMTarget.NONE)
+                    self.stats["policy/hm_supervision_non_none_frac"] = hm_mask.float().mean().item()
+                    if hm_mask.any():
+                        mean_active_hm_probs = hm_probs_float[hm_mask].mean(dim=0).cpu().numpy()
+                        for idx, value in enumerate(mean_active_hm_probs):
+                            self.stats[f"policy/hm_prob_active_{idx}"] = value
 
             # Drop noisy environment internals from terminal dashboard and W&B payload.
             self.stats = _core_stats_only(self.stats)
@@ -786,7 +802,9 @@ class CleanPuffeRL:
                     hm_aux_loss = torch.zeros((), device=self.config.device)
                     hm_accuracy = torch.zeros((), device=self.config.device)
                     hm_non_none_frac = torch.zeros((), device=self.config.device)
+                    hm_head_H = torch.zeros((), device=self.config.device)
                     hm_aux_loss_coef = self.config.get("hm_aux_loss_coef", 0.0)
+                    hm_head_entropy_coef = float(self.config.get("hm_head_entropy_coef", 0.0))
                     # NOTE: `obs` here is the flat uint8 tensor from the rollout
                     # buffer, not a dict. The policy's `encode_observations`
                     # nativizes it internally and stashes both `last_hm_logits`
@@ -801,15 +819,12 @@ class CleanPuffeRL:
                     ):
                         hm_logits_flat = hm_logits.reshape(-1, hm_logits.shape[-1])
                         hm_target_flat = hm_target.reshape(-1).long()
-                        # HM head는 rm_state 기반 NONE 라벨에 과도하게
-                        # 끌려 collapse하기 쉬움. NONE 샘플은 aux CE에서 제외해
-                        # "진짜 HM 구분"을 학습하도록 함.
+                        # 비-NONE: RM이 말하는 HM(cut/surf/…) 맞추기.
                         hm_mask = hm_target_flat != int(HMTarget.NONE)
                         if hm_mask.any():
                             masked_logits = hm_logits_flat[hm_mask]
                             masked_target = hm_target_flat[hm_mask]
-                            # 약한 스무딩으로 한 클래스(특히 CUT)로만 CE가 몰릴 때 로짓 붕괴를 완화.
-                            ls = float(self.config.get("hm_aux_label_smoothing", 0.05))
+                            ls = float(self.config.get("hm_aux_label_smoothing", 0.0))
                             hm_aux_loss = F.cross_entropy(
                                 masked_logits, masked_target, label_smoothing=ls
                             )
@@ -817,9 +832,28 @@ class CleanPuffeRL:
                                 masked_logits.argmax(dim=-1) == masked_target
                             ).float().mean()
                         hm_non_none_frac = hm_mask.float().mean()
+                        # NONE을 완전히 빼면 대부분 IDLE인데도 HM softmax가 CUT(0)으로만 붕괴함.
+                        # IDLE 샘플에 대해 클래스 NONE을 맞추는 CE를 약하게 더함 (계수로 PPO와 균형).
+                        none_ce_coef = float(self.config.get("hm_none_ce_coef", 0.0))
+                        none_mask = hm_target_flat == int(HMTarget.NONE)
+                        if none_ce_coef > 0.0 and none_mask.any():
+                            hm_aux_loss = hm_aux_loss + none_ce_coef * F.cross_entropy(
+                                hm_logits_flat[none_mask],
+                                hm_target_flat[none_mask],
+                            )
+                    # NONE은 aux CE에서 빠져 HM 헤드가 기본 클래스(cut)로 붕괴하기 쉬움.
+                    # 배치 전체 softmax 엔트로피를 약하게 올려 분포를 퍼뜨림 (CE와 함께 튜닝).
+                    if hm_head_entropy_coef != 0.0 and hm_logits is not None:
+                        hm_l = hm_logits.reshape(-1, hm_logits.shape[-1]).float()
+                        log_p = torch.log_softmax(hm_l, dim=-1)
+                        p = log_p.exp()
+                        hm_head_H = -(p * log_p).sum(dim=-1).mean()
                     loss = (
-                        pg_loss - self.config.ent_coef * entropy_loss + v_loss * self.config.vf_coef
+                        pg_loss
+                        - self.config.ent_coef * entropy_loss
+                        + v_loss * self.config.vf_coef
                         + hm_aux_loss_coef * hm_aux_loss
+                        - hm_head_entropy_coef * hm_head_H
                     )
 
                 with self.profile.learn:
@@ -838,6 +872,7 @@ class CleanPuffeRL:
                     losses.hm_aux_loss += hm_aux_loss.item() / self.experience.num_minibatches
                     losses.hm_accuracy += hm_accuracy.item() / self.experience.num_minibatches
                     losses.hm_non_none_frac += hm_non_none_frac.item() / self.experience.num_minibatches
+                    losses.hm_head_entropy += hm_head_H.item() / self.experience.num_minibatches
                     losses.entropy += entropy_loss.item() / self.experience.num_minibatches
                     losses.old_approx_kl += old_approx_kl.item() / self.experience.num_minibatches
                     losses.approx_kl += approx_kl.item() / self.experience.num_minibatches
@@ -849,14 +884,16 @@ class CleanPuffeRL:
                     break
 
         # clipfrac / KL / policy·value / HM aux 등은 PPO epoch마다 같은 방식으로 누적됨 → 돈 epoch 수로 나눠 평균 표시.
-        # entropy만 epoch마다 정책이 달라 누적 합이 익숙한 스케일이라 여기서는 나누지 않음.
+        # entropy는 epoch마다 정책이 달라져 누적 합을 유지(기존 대시보드 호환). 비교용은 entropy_mean.
         if ppo_epochs_done > 0:
             inv = 1.0 / float(ppo_epochs_done)
+            losses.entropy_mean = losses.entropy * inv
             losses.policy_loss *= inv
             losses.value_loss *= inv
             losses.hm_aux_loss *= inv
             losses.hm_accuracy *= inv
             losses.hm_non_none_frac *= inv
+            losses.hm_head_entropy *= inv
             losses.old_approx_kl *= inv
             losses.approx_kl *= inv
             losses.clipfrac *= inv
