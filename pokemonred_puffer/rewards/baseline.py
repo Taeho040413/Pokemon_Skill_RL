@@ -21,7 +21,8 @@ _RM_SUCCESS_KEYS = frozenset(
     }
 )
 
-# 탐지/정리/실패 복구/중단 등 보상 없음. rm_transition은 MENU_OPEN · MON_SELECTED 등 중간 단계만.
+# 탐지/정리/실패 복구/중단 등은 즉시 보상 0. rm_transition은 MENU_OPEN · MON_SELECTED 등 중간 단계만;
+# 중단·타임아웃 시에는 아래 _RM_CLAWBACK_KEYS에서 이번 시도 중간 보상을 차감(clawback)한다.
 _RM_NO_REWARD_KEYS = frozenset(
     {
         "rm_cut_detected",
@@ -35,6 +36,17 @@ _RM_NO_REWARD_KEYS = frozenset(
         "rm_cut_aborted",
         "rm_surf_aborted",
         "rm_flash_aborted",
+        "rm_flash_left_dark",
+    }
+)
+
+# 시도 실패 시 이번 HM 시도에서 지급된 중간(rm_transition) 보상을 되돌린다.
+_RM_CLAWBACK_KEYS = frozenset(
+    {
+        "rm_cut_aborted",
+        "rm_surf_aborted",
+        "rm_flash_aborted",
+        "rm_failed_timeout",
         "rm_flash_left_dark",
     }
 )
@@ -157,6 +169,9 @@ class BaselineRewardEnv(RedGymEnv):
         self.rm_intermediate_paid_count = 0
         self.rm_reward_from_success = 0.0
         self.rm_reward_from_intermediate = 0.0
+        self.rm_clawback_total = 0.0
+        self.rm_clawback_count = 0
+        self._rm_attempt_intermediate_pending = 0.0
         self.rm_last_step_delta = 0.0
         self.last_rm_transition_key = ""
         self.hm_supervision_target = HMTarget.NONE
@@ -164,6 +179,7 @@ class BaselineRewardEnv(RedGymEnv):
         self.hm_supervision_latch_steps_remaining = 0
         self.missing_cut_reported = False
         self.unnecessary_hm_penalty_total = 0.0
+        self.invalid_action_total = 0.0
         self._prev_invalid_cut_count = 0
         self._prev_invalid_surf_count = 0
         self._prev_invalid_flash_count = 0
@@ -182,6 +198,9 @@ class BaselineRewardEnv(RedGymEnv):
         self.rm_intermediate_paid_count = 0
         self.rm_reward_from_success = 0.0
         self.rm_reward_from_intermediate = 0.0
+        self.rm_clawback_total = 0.0
+        self.rm_clawback_count = 0
+        self._rm_attempt_intermediate_pending = 0.0
         self.rm_last_step_delta = 0.0
         self.last_rm_transition_key = ""
         self.hm_supervision_target = HMTarget.NONE
@@ -189,6 +208,7 @@ class BaselineRewardEnv(RedGymEnv):
         self.hm_supervision_latch_steps_remaining = 0
         self.missing_cut_reported = False
         self.unnecessary_hm_penalty_total = 0.0
+        self.invalid_action_total = 0.0
         ret = super().reset(*args, **kwargs)
         self._prev_invalid_cut_count = len(self.invalid_cut_coords)
         self._prev_invalid_surf_count = len(self.invalid_surf_coords)
@@ -211,6 +231,10 @@ class BaselineRewardEnv(RedGymEnv):
             if total_new > 0:
                 self.unnecessary_hm_penalty_total += -abs(hm_pen) * total_new
 
+        menu_pen = float(self.reward_config.get("invalid_menu_navigation_penalty", 0.0))
+        if menu_pen != 0.0 and self.is_start_menu_illegal_navigation_active():
+            self.invalid_action_total += -abs(menu_pen)
+
         self.update_reward_machine_reward()
         # step_penalty는 스텝마다 누적. rm_reward와 동일하게 cumulative로 관리해
         # 에피소드 말미 로그에서 episode 총 패널티가 보이도록 한다.
@@ -226,6 +250,7 @@ class BaselineRewardEnv(RedGymEnv):
             "rm_reward": self.rm_reward_total,
             "step_penalty": self.step_penalty_total,
             "unnecessary_hm_penalty": self.unnecessary_hm_penalty_total,
+            "invalid_action": self.invalid_action_total,
         }
 
     def _rm_reward_for_transition_key(self, key: str) -> float:
@@ -249,27 +274,44 @@ class BaselineRewardEnv(RedGymEnv):
         # 여러 RM 전이가 연쇄되어야 한다. transition()은 1회 1전이만 하므로, 메뉴 플래그가
         # 다음 스텝 맨 앞에 0으로 초기화되면 체인이 끊긴다.
         _MAX_RM_CHAIN = 32
+        clawback_enabled = bool(
+            self.reward_config.get("rm_clawback_intermediate_on_abort", True)
+        )
         for _ in range(_MAX_RM_CHAIN):
             step = self.reward_machine.transition(context)
             if not step.changed or not step.transition_key:
                 break
-            transition_keys_this_step.append(step.transition_key)
+            key = step.transition_key
+            transition_keys_this_step.append(key)
 
-            amt = self._rm_reward_for_transition_key(step.transition_key)
+            self.rm_transition_count += 1
+            self.last_rm_transition_key = key
+
+            if key in _RM_CLAWBACK_KEYS:
+                clawback = self._rm_attempt_intermediate_pending
+                self._rm_attempt_intermediate_pending = 0.0
+                if clawback_enabled and clawback > 0.0:
+                    self.rm_reward_total -= clawback
+                    self.rm_last_step_delta -= clawback
+                    self.rm_clawback_total += clawback
+                    self.rm_clawback_count += 1
+                continue
+
+            amt = self._rm_reward_for_transition_key(key)
             self.rm_reward_total += amt
             self.rm_last_step_delta += amt
-            self.rm_transition_count += 1
-            self.last_rm_transition_key = step.transition_key
-            if step.transition_key in _RM_SUCCESS_KEYS:
+            if key in _RM_SUCCESS_KEYS:
+                self._rm_attempt_intermediate_pending = 0.0
                 self.rm_success_count += 1
                 self.rm_reward_from_success += amt
-                if step.transition_key == "rm_cut_success":
+                if key == "rm_cut_success":
                     self.rm_cut_success_count += 1
-                elif step.transition_key == "rm_surf_success":
+                elif key == "rm_surf_success":
                     self.rm_surf_success_count += 1
-                elif step.transition_key == "rm_flash_success":
+                elif key == "rm_flash_success":
                     self.rm_flash_success_count += 1
             elif amt > 0.0:
+                self._rm_attempt_intermediate_pending += amt
                 self.rm_intermediate_paid_count += 1
                 self.rm_reward_from_intermediate += amt
 

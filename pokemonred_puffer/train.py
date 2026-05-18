@@ -57,7 +57,7 @@ DEFAULT_CONFIG = "config.yaml"
 DEFAULT_POLICY = "multi_convolutional.MultiConvolutionalPolicy"
 DEFAULT_REWARD = "baseline.ObjectRewardRequiredEventsMapIdsFieldMoves"
 DEFAULT_WRAPPER = "baseline"
-DEFAULT_ROM = "training3.gb"
+DEFAULT_ROM = "training1.gb"
 # Default run folder: runs/<DEFAULT_EXP_ID>/ (model_*.pt, trainer_state.pt). Override with --exp-name / -e.
 DEFAULT_EXP_ID = "pokeSkill001"
 
@@ -73,15 +73,25 @@ def make_policy(env: RedGymEnv, policy_name: str, config: DictConfig) -> nn.Modu
     policy_module = importlib.import_module(f"pokemonred_puffer.policies.{policy_module_name}")
     policy_class = getattr(policy_module, policy_class_name)
 
-    policy = policy_class(env, **config.policies[policy_name].policy)
+    policy_cfg = config.policies[policy_name].policy
+    policy = policy_class(env, **policy_cfg)
     if config.train.use_rnn:
         rnn_config = config.policies[policy_name].rnn
-        if policy_name == "multi_convolutional.MultiConvolutionalPolicy":
-            expected_input_size = int(config.policies[policy_name].policy.hidden_size) + len(HMTarget)
-            with open_dict(rnn_config.args):
-                rnn_config.args.input_size = expected_input_size
+        rnn_args = dict(OmegaConf.to_container(rnn_config.args, resolve=True))
+        # LSTM 입력 = policy trunk(512) + HM softmax(4). config와 어긋나면 evaluate에서 assert 실패.
+        from pokemonred_puffer.policies.multi_convolutional import HM_FEATURE_COUNT
+
+        hidden_size = int(policy_cfg.get("hidden_size", 512))
+        expected_input_size = hidden_size + HM_FEATURE_COUNT
+        configured = int(rnn_args.get("input_size", expected_input_size))
+        if configured != expected_input_size:
+            print(
+                f"[policy] rnn.input_size {configured} -> {expected_input_size} "
+                f"(hidden_size={hidden_size} + HM_FEATURE_COUNT={HM_FEATURE_COUNT})"
+            )
+        rnn_args["input_size"] = expected_input_size
         policy_class = getattr(policy_module, rnn_config.name)
-        policy = policy_class(env, policy, **rnn_config.args)
+        policy = policy_class(env, policy, **rnn_args)
         policy = pufferlib.frameworks.cleanrl.RecurrentPolicy(policy)
     else:
         policy = pufferlib.frameworks.cleanrl.Policy(policy)
@@ -375,14 +385,6 @@ def find_latest_model_path(data_dir: str | Path, exp_id: str) -> Path | None:
     return max(model_paths, key=lambda path: path.stat().st_mtime)
 
 
-def _torch_load_module_checkpoint(path: str | Path, map_location: str | torch.device):
-    """Saved files are full ``nn.Module`` pickles, not ``state_dict``. PyTorch 2.6+ defaults ``weights_only=True``."""
-    try:
-        return torch.load(path, map_location=map_location, weights_only=False)
-    except TypeError:
-        return torch.load(path, map_location=map_location)
-
-
 def _is_uninitialized_state_entry(entry: Any) -> bool:
     return isinstance(entry, (UninitializedParameter, UninitializedBuffer))
 
@@ -595,8 +597,8 @@ def load_latest_policy_if_available(
     try:
         if driver_env is not None:
             _materialize_lazy_policy_modules(policy, driver_env, config.train.device)
-        checkpoint_policy = _torch_load_module_checkpoint(
-            latest_model_path, config.train.device
+        checkpoint_policy = cleanrl_puffer.torch_load_policy_checkpoint(
+            latest_model_path, map_location=config.train.device
         )
         checkpoint_policy = checkpoint_policy.to(config.train.device)
         live_rnn = cleanrl_puffer._rollout_recurrent_core(policy)

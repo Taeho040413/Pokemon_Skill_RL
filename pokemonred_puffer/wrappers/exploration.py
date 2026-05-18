@@ -111,11 +111,6 @@ class DecayWrapper(gym.Wrapper):
                 (k, max(0.15, v * factor["signs"]))
                 for k, v in self.env.unwrapped.seen_signs.items()
             )
-        if "safari_zone_steps" in factor:
-            self.env.unwrapped.safari_zone_steps.update(
-                (k, max(0.15, v * factor["safari_zone_steps"]))
-                for k, v in self.env.unwrapped.safari_zone_steps.items()
-            )
 
         if self.env.unwrapped.read_m("wIsInBattle") == 0:
             self.env.unwrapped.seen_start_menu *= factor["start_menu"]
@@ -170,9 +165,6 @@ class OnResetExplorationWrapper(gym.Wrapper):
                 self.env.unwrapped.seen_warps.clear()
                 self.env.unwrapped.seen_hidden_objs.clear()
                 self.env.unwrapped.seen_signs.clear()
-                self.env.unwrapped.safari_zone_steps.update(
-                    (k, 0) for k in self.env.unwrapped.safari_zone_steps.keys()
-                )
             self.counter += 1
         return self.env.step(action)
 
@@ -237,11 +229,6 @@ class OnResetLowerToFixedValueWrapper(gym.Wrapper):
             self.env.unwrapped.seen_signs.update(
                 (k, self.fixed_value["signs"])
                 for k, v in self.env.unwrapped.seen_signs.items()
-                if v > 0
-            )
-            self.env.unwrapped.safari_zone_steps.update(
-                (k, self.fixed_value["safari_zone_steps"])
-                for k, v in self.env.unwrapped.safari_zone_steps.items()
                 if v > 0
             )
         return self.env.unwrapped.step(action)

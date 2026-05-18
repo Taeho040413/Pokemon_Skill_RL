@@ -77,67 +77,27 @@ def _safe_wandb_log_artifact(run, artifact: wandb.Artifact) -> None:
     except Exception as exc:
         print(f"[wandb] log_artifact failed (checkpoint already on disk): {exc}")
 
-def _wandb_environment_metrics(stats: dict) -> dict:
-    """Subset of evaluate stats for W&B (skip exploration/badges/events menus, etc.)."""
-    out: dict = {}
-    for k, v in stats.items():
-        if k in (
-            "reward",
-            "reward_sum",
-            "episode_return",
-            "episode_length",
-            "required_count",
-            "stats/rm_transition_count",
-            "stats/rm_reward_total",
-            "stats/rm_success_count",
-            "stats/rm_cut_success_count",
-            "stats/rm_surf_success_count",
-            "stats/rm_flash_success_count",
-            "stats/rm_intermediate_paid_count",
-            "stats/rm_reward_from_success",
-            "stats/rm_reward_from_intermediate",
-            "stats/rm_step_delta",
-            "stats/cut_count",
-            "stats/rm_state",
-            "stats/hm_target",
-            "stats/hm_supervision_target",
-            "stats/last_action",
-        ):
-            out[f"environment/{k}"] = v
-        elif (
-            k.startswith("policy/")
-            or k.startswith("Media/")
-            or k.startswith("reward/")
-            or k.startswith("stats/action_count/")
-        ):
-            out[f"environment/{k}"] = v
-    return out
 
-
-_CORE_STAT_KEYS = {
-    "reward",
-    "reward_sum",
-    "episode_return",
-    "episode_length",
-    "required_count",
-    "stats/required_count",
-    "stats/rm_transition_count",
-    "stats/rm_reward_total",
-    "stats/rm_success_count",
-    "stats/rm_cut_success_count",
-    "stats/rm_surf_success_count",
-    "stats/rm_flash_success_count",
-    "stats/rm_intermediate_paid_count",
-    "stats/rm_reward_from_success",
-    "stats/rm_reward_from_intermediate",
-    "stats/rm_step_delta",
-    "stats/cut_count",
-    "stats/rm_state",
-    "stats/hm_target",
-    "stats/hm_supervision_target",
-    "stats/last_action",
-}
-_CORE_STAT_PREFIXES = ("policy/", "reward/", "stats/action_count/")
+_CORE_STAT_KEYS = frozenset(
+    {
+        "reward",
+        "episode_return",
+        "required_count",
+        "stats/required_count",
+        "stats/rm_success_count",
+        "stats/rm_cut_success_count",
+        "stats/rm_surf_success_count",
+        "stats/rm_flash_success_count",
+        "stats/rm_intermediate_paid_count",
+        "stats/rm_transition_reward",
+        "stats/rm_clawback_total",
+        "stats/rm_step_delta",
+        "stats/rm_state",
+        "stats/hm_target",
+        "stats/hm_supervision_target",
+    }
+)
+_CORE_STAT_PREFIXES = ("policy/", "reward/")
 
 
 def _core_stats_only(stats: dict) -> dict:
@@ -147,6 +107,15 @@ def _core_stats_only(stats: dict) -> dict:
         if k in _CORE_STAT_KEYS or any(k.startswith(prefix) for prefix in _CORE_STAT_PREFIXES):
             out[k] = v
     return out
+
+
+def _wandb_environment_metrics(stats: dict) -> dict:
+    """Evaluate stats를 W&B용 ``environment/*`` 키로 올림. 규칙은 `_core_stats_only`와 동일 + ``Media/``."""
+    merged = dict(_core_stats_only(stats))
+    for k, v in stats.items():
+        if k.startswith("Media/"):
+            merged[k] = v
+    return {f"environment/{k}": v for k, v in merged.items()}
 
 
 def _rollout_recurrent_core(agent: nn.Module) -> nn.Module | None:
@@ -283,6 +252,39 @@ def get_policy_attr(policy: nn.Module, attr_name: str):
     return None
 
 
+def read_hm_head_coeffs(cfg) -> tuple[float, float, float, float]:
+    """HM 보조 손실 4계수: (aux_ce, none_ce, label_smoothing, entropy_bonus).
+
+    우선 ``train.hm_head`` 블록, 없으면 예전 플랫 키
+    (hm_aux_loss_coef, hm_none_ce_coef, …).
+    """
+    get = cfg.get if hasattr(cfg, "get") else lambda k, d=None: getattr(cfg, k, d)
+    blk = get("hm_head")
+    if blk is None:
+        return (
+            float(get("hm_aux_loss_coef", 0.0)),
+            float(get("hm_none_ce_coef", 0.0)),
+            float(get("hm_aux_label_smoothing", 0.0)),
+            float(get("hm_head_entropy_coef", 0.0)),
+        )
+
+    def pick(nested_key: str, flat_key: str, default: float = 0.0) -> float:
+        if hasattr(blk, "get"):
+            v = blk.get(nested_key)
+        else:
+            v = getattr(blk, nested_key, None)
+        if v is not None:
+            return float(v)
+        return float(get(flat_key, default))
+
+    return (
+        pick("aux_ce", "hm_aux_loss_coef", 0.0),
+        pick("none_ce", "hm_none_ce_coef", 0.0),
+        pick("label_smoothing", "hm_aux_label_smoothing", 0.0),
+        pick("entropy_bonus", "hm_head_entropy_coef", 0.0),
+    )
+
+
 @dataclass
 class Losses:
     policy_loss: float = 0.0
@@ -290,7 +292,7 @@ class Losses:
     hm_aux_loss: float = 0.0
     hm_accuracy: float = 0.0
     hm_non_none_frac: float = 0.0
-    # 배치 평균 HM softmax 엔트로피 (hm_head_entropy_coef>0일 때만 의미 있음).
+    # 배치 평균 HM softmax 엔트로피 (train.hm_head.entropy_bonus > 0 일 때만 의미 있음).
     hm_head_entropy: float = 0.0
     # PPO update에서 epoch마다 누적 합(아래 주석). KL 조기 종료 시 epoch 수가 달라 스케일이 흔들림.
     entropy: float = 0.0
@@ -394,7 +396,8 @@ class CleanPuffeRL:
             del self.infos[k]
 
         with self.profile.eval_misc:
-            policy = self.policy
+            # torch.compile + LSTMWrapper(동적 env_id 배치) 조합이 evaluate에서 dynamo assert를 유발할 수 있음.
+            policy = self.uncompiled_policy if self.config.compile else self.policy
             lstm_h, lstm_c = self.experience.lstm_h, self.experience.lstm_c
 
         while not self.experience.full:
@@ -733,6 +736,9 @@ class CleanPuffeRL:
             self.experience.flatten_batch(advantages_np)
 
         ppo_epochs_done = 0
+        hm_aux_loss_coef, hm_none_ce_coef, hm_aux_label_smoothing, hm_head_entropy_coef = (
+            read_hm_head_coeffs(self.config)
+        )
         for _ in range(self.config.update_epochs):
             lstm_state = None
             for mb in range(self.experience.num_minibatches):
@@ -801,13 +807,10 @@ class CleanPuffeRL:
                     hm_accuracy = torch.zeros((), device=self.config.device)
                     hm_non_none_frac = torch.zeros((), device=self.config.device)
                     hm_head_H = torch.zeros((), device=self.config.device)
-                    hm_aux_loss_coef = self.config.get("hm_aux_loss_coef", 0.0)
-                    hm_head_entropy_coef = float(self.config.get("hm_head_entropy_coef", 0.0))
                     # NOTE: `obs` here is the flat uint8 tensor from the rollout
                     # buffer, not a dict. The policy's `encode_observations`
                     # nativizes it internally and stashes both `last_hm_logits`
-                    # and `last_hm_target` so the auxiliary CE loss can be
-                    # computed against the current HM supervision target.
+                    # and `last_hm_target` (from obs `hm_supervision_target`) for aux CE.
                     hm_logits = get_policy_attr(self.policy, "last_hm_logits")
                     hm_target = get_policy_attr(self.policy, "last_hm_target")
                     if (
@@ -822,7 +825,7 @@ class CleanPuffeRL:
                         if hm_mask.any():
                             masked_logits = hm_logits_flat[hm_mask]
                             masked_target = hm_target_flat[hm_mask]
-                            ls = float(self.config.get("hm_aux_label_smoothing", 0.0))
+                            ls = hm_aux_label_smoothing
                             hm_aux_loss = F.cross_entropy(
                                 masked_logits, masked_target, label_smoothing=ls
                             )
@@ -832,10 +835,9 @@ class CleanPuffeRL:
                         hm_non_none_frac = hm_mask.float().mean()
                         # NONE을 완전히 빼면 대부분 IDLE인데도 HM softmax가 CUT(0)으로만 붕괴함.
                         # IDLE 샘플에 대해 클래스 NONE을 맞추는 CE를 약하게 더함 (계수로 PPO와 균형).
-                        none_ce_coef = float(self.config.get("hm_none_ce_coef", 0.0))
                         none_mask = hm_target_flat == int(HMTarget.NONE)
-                        if none_ce_coef > 0.0 and none_mask.any():
-                            hm_aux_loss = hm_aux_loss + none_ce_coef * F.cross_entropy(
+                        if hm_none_ce_coef > 0.0 and none_mask.any():
+                            hm_aux_loss = hm_aux_loss + hm_none_ce_coef * F.cross_entropy(
                                 hm_logits_flat[none_mask],
                                 hm_target_flat[none_mask],
                             )
@@ -999,13 +1001,6 @@ class CleanPuffeRL:
         os.rename(state_path + ".tmp", state_path)
         print(f"[checkpoint] Trainer state written: {state_path}")
         return model_path
-
-    def calculate_loss(self, pg_loss, entropy_loss, v_loss):
-        loss = pg_loss - self.config.ent_coef * entropy_loss + v_loss * self.config.vf_coef
-        self.optimizer.zero_grad()
-        loss.backward()
-        nn.utils.clip_grad_norm_(self.policy.parameters(), self.config.max_grad_norm)
-        self.optimizer.step()
 
     def done_training(self):
         return (

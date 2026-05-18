@@ -27,12 +27,19 @@ def _ctx(**overrides) -> RewardMachineContext:
     defaults = dict(
         step_count=0,
         has_cut=False, has_flash=False, has_surf=False,
+        beat_brock=False, beat_misty=False, got_hm01=False, beat_lt_surge=False,
+        got_hm05=False, beat_rocket_hideout_giovanni=False,
+        beat_route12_snorlax=False, beat_route16_snorlax=False,
+        got_hm03=False, beat_koga=False,
+        has_cut=False, has_flash=False, has_surf=False,
         auto_flash=False,
         used_cut_successfully=False, valid_cut_coords_count=0,
         valid_surf_coords_count=0, valid_flash_coords_count=0,
         used_surf_successfully=False, is_surfing=False,
         tile_in_front=0x00,
         start_menu_open=False, pokemon_menu_open=False,
+        invalid_cut_coords_count=0,
+        start_menu_open=False, pokemon_menu_open=False, bag_menu_open=False,
         invalid_cut_coords_count=0,
         invalid_surf_coords_count=0, invalid_flash_coords_count=0,
         in_dark_cave=False, flash_cycle_has_new_success=False,
@@ -138,7 +145,7 @@ class TestCut:
         _step(rm, 1, has_cut=True, tile_in_front=0x00)
         assert rm.state == RewardMachineState.IDLE
         # idle_cut_entry_ok가 True로 재무장됐으므로 다시 같은 타일 → 재진입 가능
-        s = _step(rm, 2, has_cut=True, tile_in_front=_CUT_TILE)
+        _step(rm, 2, has_cut=True, tile_in_front=_CUT_TILE)
         assert rm.state == RewardMachineState.CUT_DETECTED
 
     def test_reentry_after_abort_and_rearm(self):
@@ -167,7 +174,7 @@ class TestCut:
         _step(rm, 0, has_cut=True, tile_in_front=_CUT_TILE)
         assert rm.state == RewardMachineState.CUT_DETECTED
         # DETECTED를 abort하지 않고 유지 (메뉴도 안 열고)
-        s = _step(rm, 1, has_cut=True, tile_in_front=_CUT_TILE)
+        _step(rm, 1, has_cut=True, tile_in_front=_CUT_TILE)
         # CUT_DETECTED 유지 또는 MENU_OPEN 전이만 가능; 다시 IDLE→DETECTED 루프 없음
         assert rm.state in {RewardMachineState.CUT_DETECTED, RewardMachineState.CUT_MENU_OPEN}
 
@@ -197,7 +204,7 @@ class TestCut:
         assert rm.state == RewardMachineState.CUT_MON_SELECTED
 
         # valid_cut_coords_count 증분이 없어도 이번 사이클에서 컷 성공으로 간주.
-        s = _step(
+        _step(
             rm,
             3,
             has_cut=True,
@@ -226,7 +233,7 @@ class TestCut:
         assert rm.state == RewardMachineState.FAILED
 
         # 64 스텝 이상 대기 → IDLE 복구
-        s = _step(rm, 257 + 64 + 1)
+        _step(rm, 257 + 64 + 1)
         assert rm.state == RewardMachineState.IDLE
 
     def test_invalid_increase_triggers_failed(self):
@@ -304,7 +311,7 @@ class TestSurf:
         _step(rm, 4)
         assert rm.state == RewardMachineState.IDLE
         # 물 위에서 다시 시도 → 재진입 차단
-        s = _step(rm, 5, has_surf=True, tile_in_front=SURF_TILE_IN_FRONT, is_surfing=True)
+        _step(rm, 5, has_surf=True, tile_in_front=SURF_TILE_IN_FRONT, is_surfing=True)
         assert rm.state == RewardMachineState.IDLE
 
     def test_surf_success_requires_new_surf(self):
@@ -320,6 +327,7 @@ class TestSurf:
 
 
 # ─────────────────────────────────────────────────────────────────
+# 3. FLASH
 # 3. FLASH
 # ─────────────────────────────────────────────────────────────────
 class TestFlash:
@@ -412,7 +420,7 @@ class TestFlash:
         assert rm.state == RewardMachineState.FLASH_MON_SELECTED
 
         # 메뉴 닫힘, 아직 동굴 내부
-        s = _step(rm, 3, has_flash=True, in_dark_cave=True)
+        _step(rm, 3, has_flash=True, in_dark_cave=True)
         assert rm.state == RewardMachineState.FLASH_MON_SELECTED
 
     def test_idle_no_reentry_immediately_after_detected(self):
@@ -434,7 +442,7 @@ class TestFlash:
         assert rm.state == RewardMachineState.FLASH_DETECTED
         # abort 없이 다음 스텝에 abort 조건 부여 (동굴 밖으로 나가지 않고)
         # → FLASH_DETECTED에서 아무 전이 없음 (start_menu도 없음)
-        s = _step(rm, 1, has_flash=True, in_dark_cave=True)
+        _step(rm, 1, has_flash=True, in_dark_cave=True)
         assert rm.state == RewardMachineState.FLASH_DETECTED
 
     def test_flash_failed_timeout(self):
@@ -462,7 +470,7 @@ class TestFlash:
         # 동굴 밖 → idle_flash_entry_ok 재무장
         _step(rm, 5, has_flash=True, in_dark_cave=False)
         # 새 동굴 진입 → 재진입
-        s = _step(rm, 6, has_flash=True, in_dark_cave=True)
+        _step(rm, 6, has_flash=True, in_dark_cave=True)
         assert rm.state == RewardMachineState.FLASH_DETECTED
 
     def test_hm_target_is_flash_in_chain(self):
@@ -477,23 +485,32 @@ class TestFlash:
 
 # ─────────────────────────────────────────────────────────────────
 # 4. 우선순위: 동굴에서 컷 가능 타일 앞 → CUT이 FLASH보다 먼저
+# 4. 우선순위: 동굴에서 컷 가능 타일 앞 → CUT이 FLASH보다 먼저
 # ─────────────────────────────────────────────────────────────────
 class TestPriority:
     def test_cut_before_flash(self):
         """어두운 동굴에서 컷 가능 타일 앞 → CUT_DETECTED 먼저."""
         rm = RewardMachine()
-        s = _step(rm, 0, has_cut=True, has_flash=True,
+        _step(rm, 0, has_cut=True, has_flash=True,
                   tile_in_front=_CUT_TILE, in_dark_cave=True)
         assert rm.state == RewardMachineState.CUT_DETECTED
 
     def test_flash_when_no_cut_tile(self):
         """컷 타일 없는 어두운 동굴 → FLASH_DETECTED."""
         rm = RewardMachine()
-        s = _step(rm, 0, has_flash=True, tile_in_front=0x00, in_dark_cave=True)
+        _step(rm, 0, has_flash=True, tile_in_front=0x00, in_dark_cave=True)
+        assert rm.state == RewardMachineState.FLASH_DETECTED
+
+    def test_snorlax_tile_in_dark_cave_triggers_flash(self):
+        """포켓플루트 RM 제거 후: 스노랙스 타일(0x43) 앞이어도 어두운 동굴이면 FLASH 우선."""
+        rm = RewardMachine()
+        _step(rm, 0, has_flash=True, has_cut=False,
+              tile_in_front=0x43, in_dark_cave=True)
         assert rm.state == RewardMachineState.FLASH_DETECTED
 
 
 # ─────────────────────────────────────────────────────────────────
+# 5. HM Target 매핑 검증
 # 5. HM Target 매핑 검증
 # ─────────────────────────────────────────────────────────────────
 class TestHMTarget:
@@ -513,6 +530,7 @@ class TestHMTarget:
 
 
 # ─────────────────────────────────────────────────────────────────
+# 6. reset() 완전 초기화 검증
 # 6. reset() 완전 초기화 검증
 # ─────────────────────────────────────────────────────────────────
 class TestReset:

@@ -13,6 +13,16 @@ _CUT_TILE = next(iter(CUTTABLE_TILES))
 def _ctx(**overrides) -> RewardMachineContext:
     defaults = dict(
         step_count=0,
+        beat_brock=False,
+        beat_misty=False,
+        got_hm01=False,
+        beat_lt_surge=False,
+        got_hm05=False,
+        beat_rocket_hideout_giovanni=False,
+        beat_route12_snorlax=False,
+        beat_route16_snorlax=False,
+        got_hm03=False,
+        beat_koga=False,
         has_cut=False,
         has_flash=False,
         has_surf=False,

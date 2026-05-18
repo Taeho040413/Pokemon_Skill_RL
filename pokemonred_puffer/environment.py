@@ -3,7 +3,6 @@ import json
 import os
 import random
 import time
-import uuid
 from abc import abstractmethod
 from collections import deque
 from multiprocessing import Lock, shared_memory
@@ -14,7 +13,7 @@ import mediapy as media
 import numpy as np
 import numpy.typing as npt
 from gymnasium import Env, spaces
-from omegaconf import DictConfig, ListConfig
+from omegaconf import DictConfig, ListConfig, OmegaConf
 from pyboy import PyBoy
 from pyboy.utils import WindowEvent
 
@@ -44,12 +43,7 @@ from pokemonred_puffer.data.missable_objects import MissableFlags
 from pokemonred_puffer.data.party import PartyMons
 from pokemonred_puffer.data.strength_puzzles import STRENGTH_SOLUTIONS
 from pokemonred_puffer.data.tilesets import Tilesets
-from pokemonred_puffer.data.tm_hm import (
-    CUT_SPECIES_IDS,
-    STRENGTH_SPECIES_IDS,
-    SURF_SPECIES_IDS,
-    TmHmMoves,
-)
+from pokemonred_puffer.data.tm_hm import CUT_SPECIES_IDS, TmHmMoves
 from pokemonred_puffer.global_map import GLOBAL_MAP_SHAPE, local_to_global
 from pokemonred_puffer.rewards.reward_machine import (
     CUTTABLE_TILES,
@@ -60,8 +54,11 @@ from pokemonred_puffer.rewards.reward_machine import (
 )
 
 PIXEL_VALUES = np.array([0, 85, 153, 255], dtype=np.uint8)
-VISITED_MASK_SHAPE = (144 // 16, 160 // 16, 1)
 HM_SCREEN_CROP_SHAPE = (48, 48, 1)
+# wTileMap 상 플레이어 기준 (cut_if_next 등과 동일). 8방 단일 타일 ID (순서: 상·하·좌·우·좌상·우상·좌하·우하).
+NEAR_TILE_PLAYER_ROW = 8
+NEAR_TILE_PLAYER_COL = 8
+NEAR_TILE_MEMORY_DIM = 8
 
 
 VALID_ACTIONS = [
@@ -137,6 +134,9 @@ class RedGymEnv(Env):
         self.max_steps = env_config.max_steps
         self.save_video = env_config.save_video
         self.fast_video = env_config.fast_video
+        self.video_tail_steps = int(
+            OmegaConf.select(env_config, "video_tail_steps", default=2000)
+        )
         if self.fast_video:
             self.fps = 60
         else:
@@ -173,8 +173,6 @@ class RedGymEnv(Env):
         self.auto_solve_strength_puzzles = env_config.auto_solve_strength_puzzles
         self.auto_remove_all_nonuseful_items = env_config.auto_remove_all_nonuseful_items
         self.auto_next_elevator_floor = env_config.auto_next_elevator_floor
-        self.skip_safari_zone = env_config.skip_safari_zone
-        self.infinite_safari_steps = env_config.infinite_safari_steps
         self.insert_saffron_guard_drinks = env_config.insert_saffron_guard_drinks
         self.infinite_money = env_config.infinite_money
         self.infinite_health = env_config.infinite_health
@@ -203,15 +201,6 @@ class RedGymEnv(Env):
         self.coords_pad = 12
         self.enc_freqs = 8
 
-        # NOTE: Used for saving video
-        if env_config.save_video:
-            self.instance_id = str(uuid.uuid4())[:8]
-            self.video_dir.mkdir(exist_ok=True)
-            self.full_frame_writer = None
-            self.map_frame_writer = None
-            self.screen_obs_frame_writer = None
-            self.visited_mask_frame_writer = None
-        self.reset_count = 0
         self.all_runs = []
 
         # Set this in SOME subclasses
@@ -222,22 +211,16 @@ class RedGymEnv(Env):
             v: i for i, v in enumerate([40, 0, 12, 1, 13, 51, 2, 54, 14, 59, 60, 61, 15, 3, 65])
         }
 
+        # 관측은 screen·방향·가방·파티·RM·주변 타일·HM 크롭·맵 ID 중심 (이벤트 bit열·visited_mask 등 제외).
         obs_dict = {
             "screen": spaces.Box(low=0, high=255, shape=self.screen_output_shape, dtype=np.uint8),
-            "visited_mask": spaces.Box(
-                low=0, high=255, shape=self.screen_output_shape, dtype=np.uint8
-            ),
-            # Discrete is more apt, but pufferlib is slower at processing Discrete
+            # Discrete은 맞지만 pufferlib에서 Discrete 처리가 느려 Box로 둔다.
             "direction": spaces.Box(low=0, high=4, shape=(1,), dtype=np.uint8),
-            # "x": spaces.Box(low=0, high=255, shape=(1,), dtype=np.u`int8),
-            # "y": spaces.Box(low=0, high=255, shape=(1,), dtype=np.uint8),
             "map_id": spaces.Box(low=0, high=0xF7, shape=(1,), dtype=np.uint8),
-            # "badges": spaces.Box(low=0, high=np.iinfo(np.uint16).max, shape=(1,), dtype=np.uint16),
             "bag_items": spaces.Box(
                 low=0, high=max(Items._value2member_map_.keys()), shape=(20,), dtype=np.uint8
             ),
             "bag_quantity": spaces.Box(low=0, high=100, shape=(20,), dtype=np.uint8),
-            # This could be a dict within a sequence, but we'll do it like this and concat later
             "species": spaces.Box(low=0, high=0xBE, shape=(6,), dtype=np.uint8),
             "hp": spaces.Box(low=0, high=714, shape=(6,), dtype=np.uint32),
             "status": spaces.Box(low=0, high=7, shape=(6,), dtype=np.uint8),
@@ -246,28 +229,19 @@ class RedGymEnv(Env):
             "level": spaces.Box(low=0, high=100, shape=(6,), dtype=np.uint8),
             "maxHP": spaces.Box(low=0, high=714, shape=(6,), dtype=np.uint32),
             "moves": spaces.Box(low=0, high=0xA4, shape=(6, 4), dtype=np.uint8),
-            "events": spaces.Box(low=0, high=1, shape=(320,), dtype=np.uint8),
-            "game_corner_rocket": spaces.Box(low=0, high=1, shape=(1,), dtype=np.uint8),
-            "saffron_guard": spaces.Box(low=0, high=1, shape=(1,), dtype=np.uint8),
-            "lapras": spaces.Box(low=0, high=1, shape=(1,), dtype=np.uint8),
             "rm_state": spaces.Box(
                 low=0, high=len(RewardMachineState) - 1, shape=(1,), dtype=np.uint8
             ),
-            "hm_target": spaces.Box(low=0, high=len(HMTarget) - 1, shape=(1,), dtype=np.uint8),
             "hm_supervision_target": spaces.Box(
-                low=0, high=len(HMTarget) - 1, shape=(1,), dtype=np.uint8
+                low=0, high=int(HMTarget.NONE), shape=(1,), dtype=np.uint8
             ),
-            # HM head 전용 고해상도 로컬 시야. 전체 screen보다 덜 압축된 플레이어 주변 패턴을 준다.
+            "near_tile": spaces.Box(
+                low=0, high=255, shape=(NEAR_TILE_MEMORY_DIM,), dtype=np.uint8
+            ),
             "hm_screen": spaces.Box(
                 low=0, high=255, shape=HM_SCREEN_CROP_SHAPE, dtype=np.uint8
             ),
-            # wTileInFrontOfPlayer — RM·컷/서핑 훅과 동일 기준으로 필드 HM 판단에 쓰임.
-            "tile_in_front": spaces.Box(low=0, high=255, shape=(1,), dtype=np.uint8),
-            # 4방향 인접 타일 블록 중 물 타일이 보이는 방향 수. Surf 힌트용 보조 feature.
-            "adjacent_water_count": spaces.Box(low=0, high=4, shape=(1,), dtype=np.uint8),
         }
-        if not self.skip_safari_zone:
-            obs_dict["safari_steps"] = spaces.Box(low=0, high=502.0, shape=(1,), dtype=np.uint32)
 
         if self.use_global_map:
             obs_dict["global_map"] = spaces.Box(
@@ -305,15 +279,26 @@ class RedGymEnv(Env):
             RedGymEnv.env_id.buf[2] = (env_id >> 8) & 0xFF
             RedGymEnv.env_id.buf[3] = (env_id) & 0xFF
 
+        self._episode_video_writer = None
         if self.save_video and self.n_record:
             self.save_video = self.env_id < self.n_record
+        if self.save_video:
+            self.video_dir.mkdir(parents=True, exist_ok=True)
         self.init_mem()
 
     def register_hooks(self):
         self.pyboy.hook_register(None, "DisplayStartMenu", self.start_menu_hook, None)
         self.pyboy.hook_register(None, "RedisplayStartMenu", self.start_menu_hook, None)
+        self.pyboy.hook_register(None, "CloseStartMenu", self.close_start_menu_hook, None)
         self.pyboy.hook_register(None, "StartMenu_Item", self.item_menu_hook, None)
         self.pyboy.hook_register(None, "StartMenu_Pokemon", self.pokemon_menu_hook, None)
+        for _lbl in (
+            "StartMenu_Pokedex",
+            "StartMenu_TrainerInfo",
+            "StartMenu_SaveReset",
+            "StartMenu_Option",
+        ):
+            self.pyboy.hook_register(None, _lbl, self.start_menu_non_pokemon_branch_hook, None)
         self.pyboy.hook_register(None, "StartMenu_Pokemon.choseStats", self.chose_stats_hook, None)
         self.pyboy.hook_register(None, "StartMenu_Item.choseItem", self.chose_item_hook, None)
         self.pyboy.hook_register(None, "DisplayTextID.spriteHandling", self.sprite_hook, None)
@@ -367,6 +352,9 @@ class RedGymEnv(Env):
     def reset(self, seed: Optional[int] = None, options: Optional[dict[str, Any]] = None):
         # restart game, skipping credits
         options = options or {}
+
+        if self.save_video:
+            self._close_episode_video()
 
         infos = {}
         self.explore_map_dim = 384
@@ -474,21 +462,6 @@ class RedGymEnv(Env):
         self.seen_map_ids = np.zeros(256)
         self.seen_npcs = {}
         self.seen_warps = {}
-        self.safari_zone_steps = {
-            k: 0
-            for k in [
-                MapIds.SAFARI_ZONE_CENTER,
-                MapIds.SAFARI_ZONE_CENTER_REST_HOUSE,
-                MapIds.SAFARI_ZONE_EAST,
-                MapIds.SAFARI_ZONE_EAST_REST_HOUSE,
-                MapIds.SAFARI_ZONE_WEST,
-                # MapIds.SAFARI_ZONE_WEST_REST_HOUSE,
-                MapIds.SAFARI_ZONE_NORTH,
-                MapIds.SAFARI_ZONE_NORTH_REST_HOUSE,
-                MapIds.SAFARI_ZONE_SECRET_HOUSE,
-            ]
-        }
-
         self.valid_cut_coords = {}
         self.invalid_cut_coords = {}
         self.cut_tiles = {}
@@ -502,6 +475,10 @@ class RedGymEnv(Env):
         self.seen_hidden_objs = {}
         self.seen_signs = {}
 
+        # 스타트 메뉴에서 ITEM/도감 등 포켓몬 외 하위 메뉴로 진입했을 때 True (배틀 제외).
+        # RM용 seen_* 플래그와 달리 에피소드 동안 유지되며, CloseStartMenu·메인 메뉴 복귀 훅으로 해제된다.
+        self._start_menu_illegal_navigation = False
+
         self.seen_start_menu = 0
         self.seen_pokemon_menu = 0
         self.seen_stats_menu = 0
@@ -511,6 +488,7 @@ class RedGymEnv(Env):
         self.use_ball_count = 0
 
     def reset_mem(self):
+        self._start_menu_illegal_navigation = False
         self.seen_start_menu = 0
         self.seen_pokemon_menu = 0
         self.seen_stats_menu = 0
@@ -519,8 +497,9 @@ class RedGymEnv(Env):
         self.pokecenter_heal = 0
         self.use_ball_count = 0
         # 에피소드마다 필드무브 시도/성공 추적을 비워 훅·통계가 리셋 후 깨끗이 쌓이게 함.
-        # (reward_machine 진입은 tile_in_front 기준이며 cut_tiles 누적에는 의존하지 않음.)
+        # (reward_machine 진입은 «플레이어 앞 타일» 판단을 near_tile/wTileMap와 동일 소스로 통일.)
         self.cut_tiles = {}
+        self.surf_tiles = {}
         self.valid_cut_coords = {}
         self.invalid_cut_coords = {}
         self.valid_surf_coords = {}
@@ -559,119 +538,15 @@ class RedGymEnv(Env):
         return frame[start_y:end_y, start_x:end_x, :].astype(np.uint8, copy=False)
 
     def screen_obs(self):
-        # (144, 160, 3)
+        """전역 화면 + HM 크롭 (+ 옵션 global_map). visited_mask는 관측에서 제외."""
         raw_screen = np.expand_dims(self.screen.ndarray[:, :, 1], axis=-1)
         hm_screen = self._extract_hm_screen_crop(raw_screen)
         game_pixels_render = raw_screen
 
         if self.reduce_res:
             game_pixels_render = game_pixels_render[::2, ::2, :]
-            # game_pixels_render = skimage.measure.block_reduce(game_pixels_render, (2, 2, 1), np.min)
 
-        """
-        import cv2
-        cv2.imshow("a", game_pixels_render)
-        cv2.waitKey(150)
-        cv2.destroyAllWindows()
-        """
-
-        # place an overlay on top of the screen greying out places we haven't visited
-        # first get our location
-        player_x, player_y, map_n = self.get_game_coords()
-
-        # player is centered at 68, 72 in pixel units
-        # 68 -> player y, 72 -> player x
-        # guess we want to attempt to map the pixels to player units or vice versa
-        # Experimentally determined magic numbers below. Beware
-        # visited_mask = np.zeros(VISITED_MASK_SHAPE, dtype=np.float32)
-        visited_mask = np.zeros_like(game_pixels_render)
-        """
-        if self.taught_cut:
-            cut_mask = np.zeros_like(game_pixels_render)
-        else:
-            cut_mask = np.random.randint(0, 255, game_pixels_render.shape, dtype=np.uint8)
-        """
-        # If not in battle, set the visited mask. There's no reason to process it when in battle
-        scale = 2 if self.reduce_res else 1
-        if self.read_m(0xD057) == 0:
-            '''
-            for y in range(-72 // 16, 72 // 16):
-                for x in range(-80 // 16, 80 // 16):
-                    # y-y1 = m (x-x1)
-                    # map [(0,0),(1,1)] -> [(0,.5),(1,1)] (cause we dont wnat it to be fully black)
-                    # y = 1/2 x + .5
-                    # current location tiles - player_y*8, player_x*8
-                    """
-                    visited_mask[y, x, 0] = self.seen_coords.get(
-                        (
-                            player_x + x + 1,
-                            player_y + y + 1,
-                            map_n,
-                        ),
-                        0.15,
-                    )
-                    """
-
-                    visited_mask[
-                        (16 * y + 76) // scale : (16 * y + 16 + 76) // scale,
-                        (16 * x + 80) // scale : (16 * x + 16 + 80) // scale,
-                        :,
-                    ] = int(
-                        self.seen_coords.get(
-                            (
-                                player_x + x + 1,
-                                player_y + y + 1,
-                                map_n,
-                            ),
-                            0,
-                        )
-                        * 255
-                    )
-                    """
-                    if self.taught_cut:
-                        cut_mask[
-                            16 * y + 76 : 16 * y + 16 + 76,
-                            16 * x + 80 : 16 * x + 16 + 80,
-                            :,
-                        ] = int(
-                            255
-                            * (
-                                self.cut_coords.get(
-                                    (
-                                        player_x + x + 1,
-                                        player_y + y + 1,
-                                        map_n,
-                                    ),
-                                    0,
-                                )
-                            )
-                        )
-                        """
-            '''
-            gr, gc = local_to_global(player_y, player_x, map_n)
-            visited_mask = (
-                255
-                * np.repeat(
-                    np.repeat(self.explore_map[gr - 4 : gr + 6, gc - 4 : gc + 6], 16 // scale, 0),
-                    16 // scale,
-                    -1,
-                )
-            ).astype(np.uint8)[6 // scale : -10 // scale, :]
-            visited_mask = np.expand_dims(visited_mask, -1)
-
-        """
-        import cv2
-        cv2.imshow("a", game_pixels_render * visited_mask)
-        cv2.waitKey(250)
-        cv2.destroyAllWindows()
-        """
-
-        """
-        global_map = np.expand_dims(
-            255 * resize(self.explore_map, game_pixels_render.shape, anti_aliasing=False),
-            axis=-1,
-        ).astype(np.uint8)
-        """
+        global_map = None
         if self.use_global_map:
             global_map = np.expand_dims(
                 255 * self.explore_map,
@@ -689,20 +564,7 @@ class RedGymEnv(Env):
                 .sum(axis=1, dtype=np.uint8)
                 .reshape((-1, game_pixels_render.shape[1] // 4, 1))
             )
-            visited_mask = (
-                (
-                    np.digitize(
-                        visited_mask.reshape((-1, 4)),
-                        np.array([0, 64, 128, 255], dtype=np.uint8),
-                        right=True,
-                    ).astype(np.uint8)
-                    << np.array([6, 4, 2, 0], dtype=np.uint8)
-                )
-                .sum(axis=1, dtype=np.uint8)
-                .reshape(game_pixels_render.shape)
-                .astype(np.uint8)
-            )
-            if self.use_global_map:
+            if self.use_global_map and global_map is not None:
                 global_map = (
                     (
                         np.digitize(
@@ -716,11 +578,13 @@ class RedGymEnv(Env):
                     .reshape(self.global_map_shape)
                 )
 
-        return {
+        out: dict[str, npt.NDArray[np.uint8]] = {
             "screen": game_pixels_render,
-            "visited_mask": visited_mask,
             "hm_screen": hm_screen,
-        } | ({"global_map": global_map} if self.use_global_map else {})
+        }
+        if self.use_global_map and global_map is not None:
+            out["global_map"] = global_map
+        return out
 
     def _get_obs(self):
         # player_x, player_y, map_n = self.get_game_coords()
@@ -734,11 +598,9 @@ class RedGymEnv(Env):
             self.screen_obs()
             | {
                 "direction": np.array(
-                    self.read_m("wSpritePlayerStateData1FacingDirection") // 4, dtype=np.uint8
+                    [self.read_m("wSpritePlayerStateData1FacingDirection") // 4], dtype=np.uint8
                 ),
-                # "x": np.array(player_x, dtype=np.uint8),
-                # "y": np.array(player_y, dtype=np.uint8),
-                "map_id": np.array(self.read_m(0xD35E), dtype=np.uint8),
+                "map_id": np.array([self.read_m(0xD35E)], dtype=np.uint8),
                 "bag_items": bag[::2].copy(),
                 "bag_quantity": bag[1::2].copy(),
                 "species": np.array([self.party[i].Species for i in range(6)], dtype=np.uint8),
@@ -749,33 +611,12 @@ class RedGymEnv(Env):
                 "level": np.array([self.party[i].Level for i in range(6)], dtype=np.uint8),
                 "maxHP": np.array([self.party[i].MaxHP for i in range(6)], dtype=np.uint32),
                 "moves": np.array([self.party[i].Moves for i in range(6)], dtype=np.uint8),
-                "events": np.array(self.events.asbytes, dtype=np.uint8),
-                "game_corner_rocket": np.array(
-                    self.missables.get_missable("HS_GAME_CORNER_ROCKET"), np.uint8
-                ),  # game corner rocket
-                "saffron_guard": np.array(
-                    self.flags.get_bit("BIT_GAVE_SAFFRON_GUARDS_DRINK"), np.uint8
-                ),  # saffron guard
-                "lapras": np.array(self.flags.get_bit("BIT_GOT_LAPRAS"), np.uint8),  # got lapras
                 "rm_state": np.array([self.get_reward_machine_state_id()], dtype=np.uint8),
-                "hm_target": np.array([self.get_reward_machine_hm_target_id()], dtype=np.uint8),
                 "hm_supervision_target": np.array(
                     [self.get_hm_supervision_target_id()], dtype=np.uint8
                 ),
-                "tile_in_front": np.array(
-                    [self.get_tile_in_front_of_player()], dtype=np.uint8
-                ),
-                "adjacent_water_count": np.array(
-                    [self.get_adjacent_water_count()], dtype=np.uint8
-                ),
+                "near_tile": self.get_near_tile_memory_8(),
             }
-            | (
-                {}
-                if self.skip_safari_zone
-                else {
-                    "safari_steps": np.array(self.read_short("wSafariSteps"), dtype=np.uint32),
-                }
-            )
         )
 
     def set_perfect_iv_dvs(self):
@@ -794,9 +635,6 @@ class RedGymEnv(Env):
         return False
 
     def step(self, action):
-        if self.save_video and self.step_count == 0:
-            self.start_video()
-
         _, wMapPalOffset = self.pyboy.symbol_lookup("wMapPalOffset")
         if self.auto_flash and self.pyboy.memory[wMapPalOffset] == DARK_CAVE_MAP_PAL_OFFSET:
             self.pyboy.memory[wMapPalOffset] = 0
@@ -816,8 +654,6 @@ class RedGymEnv(Env):
             and MapIds(self.blackout_check).name not in self.disable_wild_encounters_maps
         ):
             self.pyboy.memory[self.pyboy.symbol_lookup("wRepelRemainingSteps")[1]] = 0xFF
-
-        self.update_safari_zone()
 
         self.check_num_bag_items()
 
@@ -863,7 +699,7 @@ class RedGymEnv(Env):
                     "action": VALID_ACTIONS_STR[int(action)],
                     "same_action_streak": int(self._debug_same_action_streak),
                     "stationary_steps": int(self._debug_stationary_steps),
-                    "tile_in_front": int(self.get_tile_in_front_of_player()),
+                    "near_tile": self.get_near_tile_memory_8().tolist(),
                     "use_surf": int(self.use_surf),
                     "reward_sum": float(sum(self.progress_reward.values())),
                 },
@@ -948,7 +784,18 @@ class RedGymEnv(Env):
 
         if self.save_video:
             try:
-                self.add_video_frame()
+                ms = self.get_max_steps()
+                tail = max(1, self.video_tail_steps)
+                start_at = max(1, ms - tail + 1)
+                if (
+                    self._episode_video_writer is None
+                    and self.step_count >= start_at
+                ):
+                    self.start_episode_video()
+                if self._episode_video_writer is not None:
+                    self.add_video_frame()
+                if reset:
+                    self._close_episode_video()
             except Exception as exc:
                 # region agent log
                 _append_debug_log(
@@ -1054,6 +901,7 @@ class RedGymEnv(Env):
                         self.pyboy.memory[move_addr + slot] = tmhm
                         self.pyboy.memory[pp_addr + slot] = pp
                         # fill up pp: 30/30
+                        break
                         break
 
     def cut_if_next(self):
@@ -1246,28 +1094,6 @@ class RedGymEnv(Env):
     def use_strength(self):
         self.flags.set_bit("BIT_STRENGTH_ACTIVE", 1)
 
-    def skip_safari_zone_atn(self):
-        # First move down
-        self.pyboy.button("down", 8)
-        self.pyboy.tick(self.action_freq, render=self.animate_scripts)
-        _, wBagItems = self.pyboy.symbol_lookup("wBagItems")
-        _, wNumBagItems = self.pyboy.symbol_lookup("wNumBagItems")
-        numBagItems = self.read_m(wNumBagItems)
-        bag = np.array(self.pyboy.memory[wBagItems : wBagItems + 40], dtype=np.uint8)
-        if numBagItems < 20 and not self.events.get_event("EVENT_GOT_HM03"):
-            self.events.set_event("EVENT_GOT_HM03", True)
-            bag[numBagItems * 2] = Items.HM_03.value
-            bag[numBagItems * 2 + 1] = 1
-            numBagItems += 1
-        if numBagItems < 20 and not self.missables.get_missable("HS_SAFARI_ZONE_WEST_ITEM_4"):
-            self.missables.set_missable("HS_SAFARI_ZONE_WEST_ITEM_4", True)
-            bag[numBagItems * 2] = Items.GOLD_TEETH.value
-            bag[numBagItems * 2 + 1] = 1
-            numBagItems += 1
-        bag[numBagItems * 2 :] = 0xFF
-        self.pyboy.memory[wBagItems : wBagItems + 40] = bag
-        self.pyboy.memory[wNumBagItems] = numBagItems
-
     def next_elevator_floor(self):
         curMapId = MapIds(self.read_m("wCurMap"))
         if curMapId in (MapIds.SILPH_CO_ELEVATOR, MapIds.CELADON_MART_ELEVATOR):
@@ -1367,14 +1193,29 @@ class RedGymEnv(Env):
     def start_menu_hook(self, *args, **kwargs):
         if self.read_m("wIsInBattle") == 0:
             self.seen_start_menu = 1
+            # 메인 일시정지 메뉴(처음 열기 또는 하위 메뉴에서 복귀)에서는 포켓몬 외 분기 패널티 구간 해제.
+            self._start_menu_illegal_navigation = False
+
+    def close_start_menu_hook(self, *args, **kwargs):
+        self._start_menu_illegal_navigation = False
+
+    def is_start_menu_illegal_navigation_active(self) -> bool:
+        """포켓몬 외 스타트 메뉴 분기(가방 등)에 있는 동안이며 필드에서만 패널티 대상."""
+        return bool(self._start_menu_illegal_navigation) and self.read_m("wIsInBattle") == 0
+
+    def start_menu_non_pokemon_branch_hook(self, *args, **kwargs):
+        if self.read_m("wIsInBattle") == 0:
+            self._start_menu_illegal_navigation = True
 
     def item_menu_hook(self, *args, **kwargs):
-        # if self.read_m("wIsInBattle") == 0:
         self.seen_bag_menu = 1
+        if self.read_m("wIsInBattle") == 0:
+            self._start_menu_illegal_navigation = True
 
     def pokemon_menu_hook(self, *args, **kwargs):
         if self.read_m("wIsInBattle") == 0:
             self.seen_pokemon_menu = 1
+            self._start_menu_illegal_navigation = False
 
     def chose_stats_hook(self, *args, **kwargs):
         if self.read_m("wIsInBattle") == 0:
@@ -1534,10 +1375,6 @@ class RedGymEnv(Env):
                 "badge": self.get_badges(),
                 "healr": self.total_heal_health,
                 "action_hist": self.action_hist,
-                "action_count": {
-                    name: float(self.action_hist[idx])
-                    for idx, name in enumerate(VALID_ACTIONS_STR)
-                },
                 "caught_pokemon": int(sum(self.caught_pokemon)),
                 "seen_pokemon": int(sum(self.seen_pokemon)),
                 "obtained_move_ids": int(sum(self.obtained_move_ids)),
@@ -1546,7 +1383,7 @@ class RedGymEnv(Env):
                 "taught_surf": int(self.check_if_party_has_hm(TmHmMoves.SURF.value)),
                 "taught_strength": int(self.check_if_party_has_hm(TmHmMoves.STRENGTH.value)),
                 "cut_tiles": len(self.cut_tiles),
-                # 성공한 컷 훅 횟수(고유 좌표 수). W&B `stats/cut_count`로 집계됨.
+                # 성공한 컷 훅 횟수(고유 좌표 수).
                 "cut_count": len(self.valid_cut_coords),
                 "valid_cut_coords": len(self.valid_cut_coords),
                 "invalid_cut_coords": len(self.invalid_cut_coords),
@@ -1567,9 +1404,8 @@ class RedGymEnv(Env):
                     self, "rm_intermediate_paid_count", 0
                 ),
                 "rm_reward_from_success": getattr(self, "rm_reward_from_success", 0.0),
-                "rm_reward_from_intermediate": getattr(
-                    self, "rm_reward_from_intermediate", 0.0
-                ),
+                "rm_transition_reward": getattr(self, "rm_reward_from_intermediate", 0.0),
+                "rm_clawback_total": getattr(self, "rm_clawback_total", 0.0),
                 "rm_step_delta": getattr(self, "rm_last_step_delta", 0.0),
                 "last_rm_transition": getattr(self, "last_rm_transition_key", ""),
                 "menu": {
@@ -1590,7 +1426,6 @@ class RedGymEnv(Env):
                 "max_steps": self.get_max_steps(),
                 # redundant but this is so we don't interfere with the swarm logic
                 "required_count": len(self.required_events) + len(self.required_items),
-                "safari_zone": {k.name: v for k, v in self.safari_zone_steps.items()},
                 "use_ball_count": self.use_ball_count,
             }
             | {
@@ -1604,9 +1439,7 @@ class RedGymEnv(Env):
             "events": {event: self.events.get_event(event) for event in REQUIRED_EVENTS}
             | {
                 "rival3": int(self.read_m(0xD665) == 4),
-                "game_corner_rocket": self.missables.get_missable("HS_GAME_CORNER_ROCKET"),
                 "saffron_guard": self.flags.get_bit("BIT_GAVE_SAFFRON_GUARDS_DRINK"),
-                "lapras": self.flags.get_bit("BIT_GOT_LAPRAS"),
             },
             "required_items": {item.name: item.value in bag_item_ids for item in REQUIRED_ITEMS},
             "useful_items": {item.name: item.value in bag_item_ids for item in USEFUL_ITEMS},
@@ -1622,70 +1455,71 @@ class RedGymEnv(Env):
             "moves": [list(int(m) for m in pokemon.Moves) for pokemon in self.party],
         }
 
-    def start_video(self):
-        if self.full_frame_writer is not None:
-            self.full_frame_writer.close()
-        if self.map_frame_writer is not None:
-            self.map_frame_writer.close()
-        if self.screen_obs_frame_writer is not None:
-            self.screen_obs_frame_writer.close()
-        if self.visited_mask_frame_writer is not None:
-            self.visited_mask_frame_writer.close()
-
-        base_dir = self.video_dir / Path("rollouts")
-        base_dir.mkdir(exist_ok=True)
-        full_name = Path(f"full_reset_{self.reset_count}_id{self.instance_id}").with_suffix(".mp4")
-        self.full_frame_writer = media.VideoWriter(
-            base_dir / full_name, (144, 160), fps=self.fps, input_format="gray"
+    def start_episode_video(self) -> None:
+        """에피소드 말미 tail 구간용 단일 화면 MP4 (이미 열려 있으면 무시)."""
+        if self._episode_video_writer is not None:
+            return
+        rollout_dir = self.video_dir / f"rollout{int(self.env_id):03d}"
+        rollout_dir.mkdir(parents=True, exist_ok=True)
+        out_path = rollout_dir / f"saved_video_ep{int(self.reset_count)}.mp4"
+        self._episode_video_writer = media.VideoWriter(
+            str(out_path), (144, 160), fps=self.fps, input_format="gray"
         )
-        self.full_frame_writer.__enter__()
+        self._episode_video_writer.__enter__()
 
-        map_name = Path(f"map_reset_{self.reset_count}_id{self.instance_id}").with_suffix(".mp4")
-        self.map_frame_writer = media.VideoWriter(
-            base_dir / map_name,
-            self.explore_map.shape,
-            fps=self.fps,
-            input_format="gray",
-        )
-        self.map_frame_writer.__enter__()
+    def add_video_frame(self) -> None:
+        if self._episode_video_writer is None:
+            return
+        self._episode_video_writer.add_image(self.render()[:, :])
 
-        screen_obs = self.screen_obs()
-        screen_obs_name = Path(
-            f"screen_obs_reset_{self.reset_count}_id{self.instance_id}"
-        ).with_suffix(".mp4")
-        self.screen_obs_frame_writer = media.VideoWriter(
-            base_dir / screen_obs_name,
-            screen_obs["screen"].shape[:2],
-            fps=self.fps,
-            input_format="gray",
-        )
-        self.screen_obs_frame_writer.__enter__()
-
-        visited_mask_name = Path(
-            f"visited_mask_reset_{self.reset_count}_id{self.instance_id}"
-        ).with_suffix(".mp4")
-        self.visited_mask_frame_writer = media.VideoWriter(
-            base_dir / visited_mask_name,
-            screen_obs["visited_mask"].shape[:2],
-            fps=self.fps,
-            input_format="gray",
-        )
-        self.visited_mask_frame_writer.__enter__()
-
-    def add_video_frame(self):
-        self.full_frame_writer.add_image(self.render()[:, :])
-        self.map_frame_writer.add_image(self.explore_map)
-
-        screen_obs = self.screen_obs()
-        self.screen_obs_frame_writer.add_image(screen_obs["screen"].squeeze(-1))
-        self.visited_mask_frame_writer.add_image(screen_obs["visited_mask"].squeeze(-1))
+    def _close_episode_video(self) -> None:
+        w = self._episode_video_writer
+        if w is None:
+            return
+        try:
+            w.close()
+        finally:
+            self._episode_video_writer = None
 
     def get_game_coords(self):
         return (self.read_m("wXCoord"), self.read_m("wYCoord"), self.read_m("wCurMap"))
 
+    def get_near_tile_memory_8(self) -> npt.NDArray[np.uint8]:
+        """wTileMap 기준 플레이어 주변 8방 타일 ID (상·하·좌·우·좌상·우상·좌하·우하)."""
+        _, w_tile_map = self.pyboy.symbol_lookup("wTileMap")
+        tile_map = np.array(self.pyboy.memory[w_tile_map : w_tile_map + 20 * 18], dtype=np.uint8)
+        tile_map = tile_map.reshape(18, 20)
+        py, px = NEAR_TILE_PLAYER_ROW, NEAR_TILE_PLAYER_COL
+        coords = (
+            (py - 2, px),
+            (py + 2, px),
+            (py, px - 2),
+            (py, px + 2),
+            (py - 2, px - 2),
+            (py - 2, px + 2),
+            (py + 2, px - 2),
+            (py + 2, px + 2),
+        )
+        out = np.zeros(NEAR_TILE_MEMORY_DIM, dtype=np.uint8)
+        for i, (ry, cx) in enumerate(coords):
+            if 0 <= ry < tile_map.shape[0] and 0 <= cx < tile_map.shape[1]:
+                out[i] = tile_map[ry, cx]
+        return out
+
     def get_tile_in_front_of_player(self) -> int:
-        _, addr = self.pyboy.symbol_lookup("wTileInFrontOfPlayer")
-        return int(self.pyboy.memory[addr])
+        """앞쪽 한 칸 타일 ID. ``near_tile``의 상·하·좌·우 중 바라보는 방향에 해당하는 값(wTileMap 동일 소스)."""
+        neighbors = self.get_near_tile_memory_8()
+        d = self.read_m("wSpritePlayerStateData1FacingDirection")
+        # ``surf_if_attempt`` 등과 동일: 아래 0x0, 위 0x4, 왼쪽 0x8, 오른쪽 0xC
+        if d == 0x4:
+            return int(neighbors[0])
+        if d == 0x0:
+            return int(neighbors[1])
+        if d == 0x8:
+            return int(neighbors[2])
+        if d == 0xC:
+            return int(neighbors[3])
+        return int(neighbors[1])
 
     def _supports_surf_tile_scan(self) -> bool:
         tileset = self.read_m("wCurMapTileset")
@@ -1957,35 +1791,6 @@ class RedGymEnv(Env):
             self.pyboy.memory[wBagSavedMenuItem] = 0
             self.pyboy.memory[wListScrollOffset] = 0
 
-    def update_safari_zone(self):
-        curMapId = MapIds(self.read_m("wCurMap"))
-        # scale map id performs the same check
-        if curMapId in {
-            MapIds.SAFARI_ZONE_CENTER,
-            MapIds.SAFARI_ZONE_CENTER_REST_HOUSE,
-            MapIds.SAFARI_ZONE_EAST,
-            MapIds.SAFARI_ZONE_EAST_REST_HOUSE,
-            MapIds.SAFARI_ZONE_WEST,
-            # MapIds.SAFARI_ZONE_WEST_REST_HOUSE,
-            MapIds.SAFARI_ZONE_NORTH,
-            MapIds.SAFARI_ZONE_NORTH_REST_HOUSE,
-            MapIds.SAFARI_ZONE_SECRET_HOUSE,
-        }:
-            if (
-                self.infinite_safari_steps
-                and not self.events.get_event("EVENT_GOT_HM03")
-                and not self.missables.get_missable("HS_SAFARI_ZONE_WEST_ITEM_4")
-            ):
-                _, wSafariSteps = self.pyboy.symbol_lookup("wSafariSteps")
-                # lazily set safari steps to 256. I dont want to do the math for 512
-                self.pyboy.memory[wSafariSteps] = 0
-                self.pyboy.memory[wSafariSteps + 1] = 0xFF
-
-            # update safari zone
-            self.safari_zone_steps[curMapId] = max(
-                self.safari_zone_steps[curMapId], self.read_short("wSafariSteps")
-            )
-
     def reverse_damage(self):
         for i in range(self.read_m("wPartyCount")):
             _, wPartyMonHP = self.pyboy.symbol_lookup(f"wPartyMon{i+1}HP")
@@ -2050,13 +1855,7 @@ class RedGymEnv(Env):
                 if v
             )
             | ({"rival3"} if (self.read_m("wSSAnne2FCurScript") == 4) else set())
-            | (
-                {"game_corner_rocket"}
-                if self.missables.get_missable("HS_GAME_CORNER_ROCKET")
-                else set()
-            )
             | ({"saffron_guard"} if self.flags.get_bit("BIT_GAVE_SAFFRON_GUARDS_DRINK") else set())
-            | ({"lapras"} if self.flags.get_bit("BIT_GOT_LAPRAS") else set())
         )
 
     def get_required_items(self) -> set[str]:
@@ -2125,8 +1924,5 @@ class RedGymEnv(Env):
             )
 
     def close(self):
-        if self.save_video:
-            self.full_frame_writer.close()
-            self.map_frame_writer.close()
-            self.screen_obs_frame_writer.close()
-            self.visited_mask_frame_writer.close()
+        if getattr(self, "save_video", False):
+            self._close_episode_video()

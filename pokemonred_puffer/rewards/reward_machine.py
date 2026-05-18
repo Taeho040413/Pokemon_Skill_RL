@@ -8,6 +8,7 @@ from pokemonred_puffer.data.tm_hm import TmHmMoves
 # wTileInFrontOfPlayer — 필드 HM “지금 이 타일 앞에서 시도해야 하는가” (cut_hook / surf 등과 동일 기준).
 CUTTABLE_TILES = frozenset({0x3D, 0x50})
 SURF_TILE_IN_FRONT = 0x14
+# pokered: 어두운 동굴 맵에서 wMapPalOffset == 6 (환경의 auto_flash와 동일 기준).
 DARK_CAVE_MAP_PAL_OFFSET = 6
 
 
@@ -15,6 +16,7 @@ class HMTarget(IntEnum):
     CUT = 0
     SURF = 1
     FLASH = 2
+    NONE = 3
     NONE = 3
 
 
@@ -40,6 +42,34 @@ class RewardMachineState(IntEnum):
     FLASH_SUCCESS = 12
 
     FAILED = 13  # timeout
+    FAILED = 13  # timeout
+
+
+def hm_supervision_label_from_rm_state(state_id: int) -> int:
+    """Observation에 hm_supervision_target이 없을 때 HM 보조 CE용 라벨을 rm_state로부터 유도한다."""
+    try:
+        s = RewardMachineState(state_id)
+    except ValueError:
+        return int(HMTarget.NONE)
+    if s in (
+        RewardMachineState.CUT_DETECTED,
+        RewardMachineState.CUT_MENU_OPEN,
+        RewardMachineState.CUT_MON_SELECTED,
+    ):
+        return int(HMTarget.CUT)
+    if s in (
+        RewardMachineState.SURF_DETECTED,
+        RewardMachineState.SURF_MENU_OPEN,
+        RewardMachineState.SURF_MON_SELECTED,
+    ):
+        return int(HMTarget.SURF)
+    if s in (
+        RewardMachineState.FLASH_DETECTED,
+        RewardMachineState.FLASH_MENU_OPEN,
+        RewardMachineState.FLASH_MON_SELECTED,
+    ):
+        return int(HMTarget.FLASH)
+    return int(HMTarget.NONE)
 
 
 class RewardMachineEnv(Protocol):
@@ -67,6 +97,16 @@ class RewardMachineEnv(Protocol):
 @dataclass(frozen=True)
 class RewardMachineContext:
     step_count: int
+    beat_brock: bool
+    beat_misty: bool
+    got_hm01: bool
+    beat_lt_surge: bool
+    got_hm05: bool
+    beat_rocket_hideout_giovanni: bool
+    beat_route12_snorlax: bool
+    beat_route16_snorlax: bool
+    got_hm03: bool
+    beat_koga: bool
     has_cut: bool
     has_flash: bool
     has_surf: bool
@@ -97,6 +137,18 @@ class RewardMachineContext:
 
         return cls(
             step_count=env.step_count,
+            beat_brock=events.get_event("EVENT_BEAT_BROCK"),
+            beat_misty=events.get_event("EVENT_BEAT_MISTY"),
+            got_hm01=events.get_event("EVENT_GOT_HM01"),
+            beat_lt_surge=events.get_event("EVENT_BEAT_LT_SURGE"),
+            got_hm05=Items.HM_05 in items,
+            beat_rocket_hideout_giovanni=events.get_event(
+                "EVENT_BEAT_ROCKET_HIDEOUT_GIOVANNI"
+            ),
+            beat_route12_snorlax=events.get_event("EVENT_BEAT_ROUTE12_SNORLAX"),
+            beat_route16_snorlax=events.get_event("EVENT_BEAT_ROUTE16_SNORLAX"),
+            got_hm03=events.get_event("EVENT_GOT_HM03"),
+            beat_koga=events.get_event("EVENT_BEAT_KOGA"),
             has_cut=env.check_if_party_has_hm(TmHmMoves.CUT.value),
             has_flash=env.check_if_party_has_hm(TmHmMoves.FLASH.value),
             has_surf=env.check_if_party_has_hm(TmHmMoves.SURF.value),
@@ -269,6 +321,9 @@ REWARD_MACHINE_TRANSITIONS: tuple[RewardMachineTransition, ...] = (
 
     # ── FLASH (어두운 화면; 훅: StartMenu_Pokemon.flash) ─────
     # IDLE 순서: CUT → SURF → FLASH.
+
+    # ── FLASH (어두운 동굴 wMapPalOffset==6; 훅: StartMenu_Pokemon.flash) ─────
+    # IDLE 순서: CUT → SURF → FLASH
     RewardMachineTransition(
         RewardMachineState.IDLE,
         RewardMachineState.FLASH_DETECTED,
@@ -376,6 +431,7 @@ class RewardMachine:
         self._idle_flash_entry_ok = True
 
         # HM 사이클 시작 시점의 valid_*_coords_count 스냅샷.
+        # CUT 사이클 시작 시점의 valid_*_coords_count 스냅샷.
         # *_MON_SELECTED / *_BAG_OPEN → SUCCESS 조건:
         #   이 사이클에서 실제로 새 성공이 있어야 함 (에피소드 누적 True 방지).
         # used_*_successfully는 에피소드 전체에서 True로 유지되므로
