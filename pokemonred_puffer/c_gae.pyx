@@ -20,15 +20,17 @@ def compute_gae(cnp.ndarray dones, cnp.ndarray values,
     cdef float[:] c_rewards = rewards
 
     cdef float lastgaelam = 0
-    cdef float nextnonterminal, delta
-    cdef int t, t_cur, t_next
-    for t in range(num_steps-1):
-        t_cur = num_steps - 2 - t
-        t_next = num_steps - 1 - t
-        nextnonterminal = 1.0 - c_dones[t_next]
-        delta = c_rewards[t_next] + gamma * c_values[t_next] * nextnonterminal - c_values[t_cur]
+    cdef float nextnonterminal, next_value, delta
+    cdef int t
+    for t in range(num_steps - 1, -1, -1):
+        nextnonterminal = 1.0 - c_dones[t]
+        if t < num_steps - 1:
+            next_value = c_values[t + 1]
+        else:
+            next_value = 0.0
+        delta = c_rewards[t] + gamma * next_value * nextnonterminal - c_values[t]
         lastgaelam = delta + gamma * gae_lambda * nextnonterminal * lastgaelam
-        c_advantages[t_cur] = lastgaelam
+        c_advantages[t] = lastgaelam
 
     return advantages
 

@@ -49,9 +49,14 @@ class PartyMons(Union):
     def __init__(self, emu: PyBoy):
         _, wPartyMons = emu.symbol_lookup("wPartyMons")
         _, wPartyCount = emu.symbol_lookup("wPartyCount")
-        self.party_size = emu.memory[wPartyCount]
+        self._party_mons_addr = wPartyMons
+        self._party_count_addr = wPartyCount
+        self.refresh(emu)
+
+    def refresh(self, emu: PyBoy) -> None:
+        self.party_size = emu.memory[self._party_count_addr]
         self.asbytes = (c_uint8 * PARTY_LENGTH_BYTES)(
-            *emu.memory[wPartyMons : wPartyMons + PARTY_LENGTH_BYTES]
+            *emu.memory[self._party_mons_addr : self._party_mons_addr + PARTY_LENGTH_BYTES]
         )
 
     def __getitem__(self, idx):

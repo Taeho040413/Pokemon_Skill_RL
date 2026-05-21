@@ -2,21 +2,48 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Callable, Protocol
+from typing import Callable, Iterable, Protocol
+
+from pokemonred_puffer.data.events import EventFlags
+from pokemonred_puffer.data.items import Items
 from pokemonred_puffer.data.tm_hm import TmHmMoves
 
-# wTileInFrontOfPlayer — 필드 HM “지금 이 타일 앞에서 시도해야 하는가” (cut_hook / surf 등과 동일 기준).
+# tile_in_front = env.get_tile_in_front_of_player() → WRAM wTileInFrontOfPlayer (cut_hook과 동일).
 CUTTABLE_TILES = frozenset({0x3D, 0x50})
 SURF_TILE_IN_FRONT = 0x14
+# cut_if_next / surf_if_attempt: 스타트 메뉴에서 포켓몬 줄 = wCurrentMenuItem 1.
+START_MENU_POKEMON_CURSOR = 1
 # pokered: 어두운 동굴 맵에서 wMapPalOffset == 6 (환경의 auto_flash와 동일 기준).
 DARK_CAVE_MAP_PAL_OFFSET = 6
+
+
+def _surf_menu_progress_ok(ctx: RewardMachineContext) -> bool:
+    """메뉴 체인 진행: Cut은 앞 타일이 나무인 동안만, Surf는 파티에 기술만 있으면 됨."""
+    return ctx.can_use_surf
+
+
+def _surf_abort_from_detected(ctx: RewardMachineContext) -> bool:
+    if not ctx.can_use_surf:
+        return True
+    if ctx.start_menu_open:
+        return False
+    return not ctx.surf_water_context_ok
+
+
+def _surf_abort_from_menu_state(ctx: RewardMachineContext) -> bool:
+    if ctx.is_surfing:
+        return False
+    if not ctx.can_use_surf:
+        return True
+    if ctx.start_menu_open or ctx.pokemon_menu_open or ctx.field_move_menu_open:
+        return False
+    return not ctx.surf_water_context_ok
 
 
 class HMTarget(IntEnum):
     CUT = 0
     SURF = 1
     FLASH = 2
-    NONE = 3
     NONE = 3
 
 
@@ -41,31 +68,44 @@ class RewardMachineState(IntEnum):
     FLASH_MON_SELECTED = 11
     FLASH_SUCCESS = 12
 
-    FAILED = 13  # timeout
-    FAILED = 13  # timeout
+    # wCurrentMenuItem·필드기술 메뉴 훅에 맞춘 매크로 하위 상태.
+    CUT_START_MENU = 13
+    CUT_PARTY_MENU = 14
+    SURF_START_MENU = 15
+    SURF_PARTY_MENU = 16
+    FLASH_START_MENU = 17
+    FLASH_PARTY_MENU = 18
+
+    FAILED = 19  # timeout
 
 
 def hm_supervision_label_from_rm_state(state_id: int) -> int:
-    """Observation에 hm_supervision_target이 없을 때 HM 보조 CE용 라벨을 rm_state로부터 유도한다."""
+    """obs에 hm_aux_label이 없을 때(레거시) HM 보조 CE용 라벨을 rm_state로부터 유도한다."""
     try:
         s = RewardMachineState(state_id)
     except ValueError:
         return int(HMTarget.NONE)
     if s in (
         RewardMachineState.CUT_DETECTED,
+        RewardMachineState.CUT_START_MENU,
         RewardMachineState.CUT_MENU_OPEN,
+        RewardMachineState.CUT_PARTY_MENU,
         RewardMachineState.CUT_MON_SELECTED,
     ):
         return int(HMTarget.CUT)
     if s in (
         RewardMachineState.SURF_DETECTED,
+        RewardMachineState.SURF_START_MENU,
         RewardMachineState.SURF_MENU_OPEN,
+        RewardMachineState.SURF_PARTY_MENU,
         RewardMachineState.SURF_MON_SELECTED,
     ):
         return int(HMTarget.SURF)
     if s in (
         RewardMachineState.FLASH_DETECTED,
+        RewardMachineState.FLASH_START_MENU,
         RewardMachineState.FLASH_MENU_OPEN,
+        RewardMachineState.FLASH_PARTY_MENU,
         RewardMachineState.FLASH_MON_SELECTED,
     ):
         return int(HMTarget.FLASH)
@@ -73,6 +113,7 @@ def hm_supervision_label_from_rm_state(state_id: int) -> int:
 
 
 class RewardMachineEnv(Protocol):
+    events: EventFlags
     auto_flash: bool
     valid_cut_coords: dict
     invalid_cut_coords: dict
@@ -87,11 +128,15 @@ class RewardMachineEnv(Protocol):
 
     def check_if_party_has_hm(self, hm: int) -> bool: ...
 
+    def get_items_in_bag(self) -> Iterable[Items]: ...
+
     def get_tile_in_front_of_player(self) -> int: ...
 
     def get_map_pal_offset(self) -> int: ...
 
     def get_rm_flash_cycle_start(self) -> int: ...
+
+    def player_faces_adjacent_water(self) -> bool: ...
 
 
 @dataclass(frozen=True)
@@ -113,16 +158,25 @@ class RewardMachineContext:
     auto_flash: bool
     used_cut_successfully: bool
     valid_cut_coords_count: int
-    # 서핑 성공 횟수: per-cycle count 가드에 사용. is_surfing은 물 위 모든 스텝에서 True라서
-    # 단독으로 쓰면 매 스텝 SUCCESS가 발화한다.
+    # 이번 에이전트 스텝에서 cut_hook 등으로 새로 추가된 성공 횟수 (한 스텝에 메뉴+컷 완료 시 RM용).
+    valid_cut_coords_delta: int
+    # 서핑: per-cycle 가드는 훅 발화 횟수 기준 (valid_surf_coords는 고유 좌표만이라 재서핑 시 len 불변).
     valid_surf_coords_count: int
+    valid_surf_coords_delta: int
+    surf_hook_success_count: int
+    surf_hook_success_delta: int
     valid_flash_coords_count: int
+    valid_flash_coords_delta: int
     used_surf_successfully: bool
     # 서핑 중이면 앞 타일이 물/0x14가 아닐 때가 많아 재무장만으로는 루프가 남음 → IDLE→SURF 차단에 사용.
     is_surfing: bool
     tile_in_front: int
+    # wTileMap 기준 바라보는 방향에 물(0x14)이 있음 (정면 wTileInFrontOfPlayer와 다를 수 있음).
+    faces_adjacent_water: bool
     start_menu_open: bool
     pokemon_menu_open: bool
+    field_move_menu_open: bool
+    current_menu_item: int
     invalid_cut_coords_count: int
     invalid_surf_coords_count: int
     invalid_flash_coords_count: int
@@ -133,6 +187,8 @@ class RewardMachineContext:
 
     @classmethod
     def from_env(cls, env: RewardMachineEnv) -> RewardMachineContext:
+        items = set(env.get_items_in_bag())
+        events = env.events
         _flash_start = int(env.get_rm_flash_cycle_start())
 
         return cls(
@@ -155,13 +211,27 @@ class RewardMachineContext:
             auto_flash=env.auto_flash,
             used_cut_successfully=bool(env.valid_cut_coords),
             valid_cut_coords_count=len(env.valid_cut_coords),
+            valid_cut_coords_delta=int(getattr(env, "_rm_valid_cut_delta", 0)),
             valid_surf_coords_count=len(env.valid_surf_coords),
+            valid_surf_coords_delta=int(getattr(env, "_rm_valid_surf_delta", 0)),
+            surf_hook_success_count=int(getattr(env, "_surf_hook_success_count", 0)),
+            surf_hook_success_delta=int(getattr(env, "_rm_valid_surf_delta", 0)),
             valid_flash_coords_count=len(env.valid_flash_coords),
+            valid_flash_coords_delta=int(getattr(env, "_rm_valid_flash_delta", 0)),
             used_surf_successfully=bool(env.valid_surf_coords) or bool(env.use_surf),
             is_surfing=bool(env.use_surf),
             tile_in_front=env.get_tile_in_front_of_player(),
-            start_menu_open=bool(env.seen_start_menu),
+            faces_adjacent_water=bool(
+                getattr(env, "player_faces_adjacent_water", lambda: False)()
+            ),
+            start_menu_open=(
+                bool(env._start_menu_open)
+                if hasattr(env, "_start_menu_open")
+                else bool(getattr(env, "seen_start_menu", 0))
+            ),
             pokemon_menu_open=bool(env.seen_pokemon_menu),
+            field_move_menu_open=bool(getattr(env, "seen_field_move_menu", 0)),
+            current_menu_item=int(getattr(env, "get_current_menu_item", lambda: 0)()),
             invalid_cut_coords_count=len(env.invalid_cut_coords),
             invalid_surf_coords_count=len(env.invalid_surf_coords),
             invalid_flash_coords_count=len(env.invalid_flash_coords),
@@ -186,6 +256,16 @@ class RewardMachineContext:
     def can_use_surf(self) -> bool:
         return self.has_surf
 
+    @property
+    def surf_detect_ok(self) -> bool:
+        """IDLE→SURF_DETECTED: 정면 물 타일만 (옆 물만으로는 감지·라벨 오탐 방지)."""
+        return self.tile_in_front == SURF_TILE_IN_FRONT
+
+    @property
+    def surf_water_context_ok(self) -> bool:
+        """메뉴 전이·abort: 정면 물 또는 facing 방향 인접 물."""
+        return self.surf_detect_ok or self.faces_adjacent_water
+
 
 @dataclass(frozen=True)
 class RewardMachineTransition:
@@ -208,6 +288,18 @@ class RewardMachineStep:
 
 REWARD_MACHINE_TRANSITIONS: tuple[RewardMachineTransition, ...] = (
     # ── CUT ──────────────────────────────────────────────────────────────────
+    # 한 PyBoy 스텝(에이전트 action 1회) 안에서 메뉴→컷까지 끝나면 최종 스냅샷만 남아
+    # 앞 타일이 이미 non-cuttable → IDLE→CUT_DETECTED 불가. 증분으로 SUCCESS 직행.
+    RewardMachineTransition(
+        RewardMachineState.IDLE,
+        RewardMachineState.CUT_SUCCESS,
+        "rm_cut_success",
+        lambda ctx: (
+            ctx.can_use_cut
+            and ctx.valid_cut_coords_delta > 0
+            and ctx.tile_in_front not in CUTTABLE_TILES
+        ),
+    ),
     RewardMachineTransition(
         RewardMachineState.IDLE,
         RewardMachineState.CUT_DETECTED,
@@ -217,11 +309,42 @@ REWARD_MACHINE_TRANSITIONS: tuple[RewardMachineTransition, ...] = (
     # 정상 순서 전이
     RewardMachineTransition(
         RewardMachineState.CUT_DETECTED,
+        RewardMachineState.CUT_START_MENU,
+        "rm_cut_start_menu",
+        lambda ctx: (
+            ctx.tile_in_front in CUTTABLE_TILES
+            and ctx.can_use_cut
+            and ctx.start_menu_open
+            and ctx.current_menu_item != START_MENU_POKEMON_CURSOR
+        ),
+    ),
+    RewardMachineTransition(
+        RewardMachineState.CUT_DETECTED,
         RewardMachineState.CUT_MENU_OPEN,
         "rm_cut_menu_open",
-        lambda ctx: ctx.tile_in_front in CUTTABLE_TILES
-        and ctx.start_menu_open
-        and ctx.can_use_cut,
+        lambda ctx: (
+            ctx.tile_in_front in CUTTABLE_TILES
+            and ctx.can_use_cut
+            and ctx.start_menu_open
+            and ctx.current_menu_item == START_MENU_POKEMON_CURSOR
+        ),
+    ),
+    RewardMachineTransition(
+        RewardMachineState.CUT_START_MENU,
+        RewardMachineState.CUT_MENU_OPEN,
+        "rm_cut_pokemon_row",
+        lambda ctx: (
+            ctx.tile_in_front in CUTTABLE_TILES
+            and ctx.can_use_cut
+            and ctx.start_menu_open
+            and ctx.current_menu_item == START_MENU_POKEMON_CURSOR
+        ),
+    ),
+    RewardMachineTransition(
+        RewardMachineState.CUT_START_MENU,
+        RewardMachineState.IDLE,
+        "rm_cut_aborted",
+        lambda ctx: ctx.tile_in_front not in CUTTABLE_TILES or not ctx.can_use_cut,
     ),
     # auto_use_cut 등: 한 스텝 끝에 메뉴가 닫히고 나무도 제거된 스냅샷만 남으면
     # CUT_DETECTED → ABORT만 반복되어 RM 보상이 0이 된다. valid_cut 증분으로 가드.
@@ -231,13 +354,38 @@ REWARD_MACHINE_TRANSITIONS: tuple[RewardMachineTransition, ...] = (
         "rm_cut_success",
         lambda ctx: ctx.can_use_cut and ctx.tile_in_front not in CUTTABLE_TILES,
     ),
+    # 한 스텝 스냅샷에 포켓몬·필드기술 메뉴 플래그가 동시에 있으면 PARTY를 건너뛴다.
     RewardMachineTransition(
         RewardMachineState.CUT_MENU_OPEN,
         RewardMachineState.CUT_MON_SELECTED,
         "rm_cut_mon_selected",
-        lambda ctx: ctx.tile_in_front in CUTTABLE_TILES
-        and ctx.pokemon_menu_open
-        and ctx.can_use_cut,
+        lambda ctx: (
+            ctx.tile_in_front in CUTTABLE_TILES
+            and ctx.can_use_cut
+            and ctx.pokemon_menu_open
+            and ctx.field_move_menu_open
+        ),
+    ),
+    RewardMachineTransition(
+        RewardMachineState.CUT_MENU_OPEN,
+        RewardMachineState.CUT_PARTY_MENU,
+        "rm_cut_party_menu",
+        lambda ctx: (
+            ctx.tile_in_front in CUTTABLE_TILES
+            and ctx.can_use_cut
+            and ctx.pokemon_menu_open
+            and not ctx.field_move_menu_open
+        ),
+    ),
+    RewardMachineTransition(
+        RewardMachineState.CUT_PARTY_MENU,
+        RewardMachineState.CUT_MON_SELECTED,
+        "rm_cut_mon_selected",
+        lambda ctx: (
+            ctx.tile_in_front in CUTTABLE_TILES
+            and ctx.can_use_cut
+            and ctx.field_move_menu_open
+        ),
     ),
     RewardMachineTransition(
         RewardMachineState.CUT_MON_SELECTED,
@@ -264,12 +412,24 @@ REWARD_MACHINE_TRANSITIONS: tuple[RewardMachineTransition, ...] = (
     ),
 
     # ── SURF ─────────────────────────────────────────────────────────────────
+    # (1) IDLE/DETECTED/MENU 등에서 is_surfing·훅으로 SUCCESS
+    # (2) 에이전트가 메뉴를 연 경우 START_MENU → … → SUCCESS 체인
+    RewardMachineTransition(
+        RewardMachineState.IDLE,
+        RewardMachineState.SURF_SUCCESS,
+        "rm_surf_success",
+        lambda ctx: (
+            ctx.can_use_surf
+            and ctx.surf_hook_success_delta > 0
+            and ctx.is_surfing
+        ),
+    ),
     RewardMachineTransition(
         RewardMachineState.IDLE,
         RewardMachineState.SURF_DETECTED,
         "rm_surf_detected",
         lambda ctx: (
-            ctx.tile_in_front == SURF_TILE_IN_FRONT
+            ctx.surf_detect_ok
             and ctx.can_use_surf
             and not ctx.is_surfing
         ),
@@ -277,11 +437,53 @@ REWARD_MACHINE_TRANSITIONS: tuple[RewardMachineTransition, ...] = (
     # 정상 순서 전이
     RewardMachineTransition(
         RewardMachineState.SURF_DETECTED,
+        RewardMachineState.SURF_START_MENU,
+        "rm_surf_start_menu",
+        lambda ctx: (
+            _surf_menu_progress_ok(ctx)
+            and ctx.start_menu_open
+            and ctx.current_menu_item != START_MENU_POKEMON_CURSOR
+        ),
+    ),
+    RewardMachineTransition(
+        RewardMachineState.SURF_DETECTED,
         RewardMachineState.SURF_MENU_OPEN,
         "rm_surf_menu_open",
-        lambda ctx: ctx.tile_in_front == SURF_TILE_IN_FRONT
-        and ctx.start_menu_open
-        and ctx.can_use_surf,
+        lambda ctx: (
+            _surf_menu_progress_ok(ctx)
+            and (
+                (ctx.start_menu_open and ctx.current_menu_item == START_MENU_POKEMON_CURSOR)
+                or ctx.pokemon_menu_open
+            )
+        ),
+    ),
+    RewardMachineTransition(
+        RewardMachineState.SURF_START_MENU,
+        RewardMachineState.SURF_PARTY_MENU,
+        "rm_surf_party_menu",
+        lambda ctx: (
+            _surf_menu_progress_ok(ctx)
+            and ctx.pokemon_menu_open
+            and not ctx.field_move_menu_open
+        ),
+    ),
+    RewardMachineTransition(
+        RewardMachineState.SURF_START_MENU,
+        RewardMachineState.SURF_MENU_OPEN,
+        "rm_surf_pokemon_row",
+        lambda ctx: (
+            _surf_menu_progress_ok(ctx)
+            and (
+                (ctx.start_menu_open and ctx.current_menu_item == START_MENU_POKEMON_CURSOR)
+                or ctx.pokemon_menu_open
+            )
+        ),
+    ),
+    RewardMachineTransition(
+        RewardMachineState.SURF_START_MENU,
+        RewardMachineState.IDLE,
+        "rm_surf_aborted",
+        _surf_abort_from_detected,
     ),
     RewardMachineTransition(
         RewardMachineState.SURF_DETECTED,
@@ -291,11 +493,59 @@ REWARD_MACHINE_TRANSITIONS: tuple[RewardMachineTransition, ...] = (
     ),
     RewardMachineTransition(
         RewardMachineState.SURF_MENU_OPEN,
+        RewardMachineState.SURF_SUCCESS,
+        "rm_surf_success",
+        lambda ctx: ctx.can_use_surf and ctx.is_surfing,
+    ),
+    RewardMachineTransition(
+        RewardMachineState.SURF_PARTY_MENU,
+        RewardMachineState.SURF_SUCCESS,
+        "rm_surf_success",
+        lambda ctx: ctx.can_use_surf and ctx.is_surfing,
+    ),
+    RewardMachineTransition(
+        RewardMachineState.SURF_MENU_OPEN,
+        RewardMachineState.IDLE,
+        "rm_surf_aborted",
+        _surf_abort_from_menu_state,
+    ),
+    RewardMachineTransition(
+        RewardMachineState.SURF_PARTY_MENU,
+        RewardMachineState.IDLE,
+        "rm_surf_aborted",
+        _surf_abort_from_menu_state,
+    ),
+    RewardMachineTransition(
+        RewardMachineState.SURF_MENU_OPEN,
         RewardMachineState.SURF_MON_SELECTED,
         "rm_surf_mon_selected",
-        lambda ctx: ctx.tile_in_front == SURF_TILE_IN_FRONT
-        and ctx.pokemon_menu_open
-        and ctx.can_use_surf,
+        lambda ctx: (
+            _surf_menu_progress_ok(ctx)
+            and ctx.pokemon_menu_open
+            and ctx.field_move_menu_open
+        ),
+    ),
+    RewardMachineTransition(
+        RewardMachineState.SURF_MENU_OPEN,
+        RewardMachineState.SURF_PARTY_MENU,
+        "rm_surf_party_menu",
+        lambda ctx: (
+            _surf_menu_progress_ok(ctx)
+            and ctx.pokemon_menu_open
+            and not ctx.field_move_menu_open
+        ),
+    ),
+    RewardMachineTransition(
+        RewardMachineState.SURF_PARTY_MENU,
+        RewardMachineState.SURF_MON_SELECTED,
+        "rm_surf_mon_selected",
+        lambda ctx: _surf_menu_progress_ok(ctx) and ctx.field_move_menu_open,
+    ),
+    RewardMachineTransition(
+        RewardMachineState.SURF_MON_SELECTED,
+        RewardMachineState.IDLE,
+        "rm_surf_aborted",
+        _surf_abort_from_menu_state,
     ),
     RewardMachineTransition(
         RewardMachineState.SURF_MON_SELECTED,
@@ -316,11 +566,8 @@ REWARD_MACHINE_TRANSITIONS: tuple[RewardMachineTransition, ...] = (
         RewardMachineState.SURF_DETECTED,
         RewardMachineState.IDLE,
         "rm_surf_aborted",
-        lambda ctx: ctx.tile_in_front != SURF_TILE_IN_FRONT or not ctx.can_use_surf,
+        _surf_abort_from_detected,
     ),
-
-    # ── FLASH (어두운 화면; 훅: StartMenu_Pokemon.flash) ─────
-    # IDLE 순서: CUT → SURF → FLASH.
 
     # ── FLASH (어두운 동굴 wMapPalOffset==6; 훅: StartMenu_Pokemon.flash) ─────
     # IDLE 순서: CUT → SURF → FLASH
@@ -332,9 +579,42 @@ REWARD_MACHINE_TRANSITIONS: tuple[RewardMachineTransition, ...] = (
     ),
     RewardMachineTransition(
         RewardMachineState.FLASH_DETECTED,
+        RewardMachineState.FLASH_START_MENU,
+        "rm_flash_start_menu",
+        lambda ctx: (
+            ctx.in_dark_cave
+            and ctx.can_use_flash
+            and ctx.start_menu_open
+            and ctx.current_menu_item != START_MENU_POKEMON_CURSOR
+        ),
+    ),
+    RewardMachineTransition(
+        RewardMachineState.FLASH_DETECTED,
         RewardMachineState.FLASH_MENU_OPEN,
         "rm_flash_menu_open",
-        lambda ctx: ctx.in_dark_cave and ctx.start_menu_open and ctx.can_use_flash,
+        lambda ctx: (
+            ctx.in_dark_cave
+            and ctx.can_use_flash
+            and ctx.start_menu_open
+            and ctx.current_menu_item == START_MENU_POKEMON_CURSOR
+        ),
+    ),
+    RewardMachineTransition(
+        RewardMachineState.FLASH_START_MENU,
+        RewardMachineState.FLASH_MENU_OPEN,
+        "rm_flash_pokemon_row",
+        lambda ctx: (
+            ctx.in_dark_cave
+            and ctx.can_use_flash
+            and ctx.start_menu_open
+            and ctx.current_menu_item == START_MENU_POKEMON_CURSOR
+        ),
+    ),
+    RewardMachineTransition(
+        RewardMachineState.FLASH_START_MENU,
+        RewardMachineState.IDLE,
+        "rm_flash_aborted",
+        lambda ctx: not ctx.in_dark_cave or not ctx.can_use_flash,
     ),
     # auto_flash off: 플래시 연출 후 밝은 스냅샷만 남으면 MON 경로 없이 성공 처리.
     # rm_flash_aborted(밝음)와 경합 → ABORT보다 먼저 평가되게 둔다.
@@ -352,7 +632,31 @@ REWARD_MACHINE_TRANSITIONS: tuple[RewardMachineTransition, ...] = (
         RewardMachineState.FLASH_MENU_OPEN,
         RewardMachineState.FLASH_MON_SELECTED,
         "rm_flash_mon_selected",
-        lambda ctx: ctx.in_dark_cave and ctx.pokemon_menu_open and ctx.can_use_flash,
+        lambda ctx: (
+            ctx.in_dark_cave
+            and ctx.can_use_flash
+            and ctx.pokemon_menu_open
+            and ctx.field_move_menu_open
+        ),
+    ),
+    RewardMachineTransition(
+        RewardMachineState.FLASH_MENU_OPEN,
+        RewardMachineState.FLASH_PARTY_MENU,
+        "rm_flash_party_menu",
+        lambda ctx: (
+            ctx.in_dark_cave
+            and ctx.can_use_flash
+            and ctx.pokemon_menu_open
+            and not ctx.field_move_menu_open
+        ),
+    ),
+    RewardMachineTransition(
+        RewardMachineState.FLASH_PARTY_MENU,
+        RewardMachineState.FLASH_MON_SELECTED,
+        "rm_flash_mon_selected",
+        lambda ctx: (
+            ctx.in_dark_cave and ctx.can_use_flash and ctx.field_move_menu_open
+        ),
     ),
     RewardMachineTransition(
         RewardMachineState.FLASH_MON_SELECTED,
@@ -389,17 +693,23 @@ HM_TARGET_BY_STATE: dict[RewardMachineState, HMTarget] = {
     RewardMachineState.IDLE: HMTarget.NONE,
 
     RewardMachineState.CUT_DETECTED: HMTarget.CUT,
+    RewardMachineState.CUT_START_MENU: HMTarget.CUT,
     RewardMachineState.CUT_MENU_OPEN: HMTarget.CUT,
+    RewardMachineState.CUT_PARTY_MENU: HMTarget.CUT,
     RewardMachineState.CUT_MON_SELECTED: HMTarget.CUT,
     RewardMachineState.CUT_SUCCESS: HMTarget.CUT,
 
     RewardMachineState.SURF_DETECTED: HMTarget.SURF,
+    RewardMachineState.SURF_START_MENU: HMTarget.SURF,
     RewardMachineState.SURF_MENU_OPEN: HMTarget.SURF,
+    RewardMachineState.SURF_PARTY_MENU: HMTarget.SURF,
     RewardMachineState.SURF_MON_SELECTED: HMTarget.SURF,
     RewardMachineState.SURF_SUCCESS: HMTarget.SURF,
 
     RewardMachineState.FLASH_DETECTED: HMTarget.FLASH,
+    RewardMachineState.FLASH_START_MENU: HMTarget.FLASH,
     RewardMachineState.FLASH_MENU_OPEN: HMTarget.FLASH,
+    RewardMachineState.FLASH_PARTY_MENU: HMTarget.FLASH,
     RewardMachineState.FLASH_MON_SELECTED: HMTarget.FLASH,
     RewardMachineState.FLASH_SUCCESS: HMTarget.FLASH,
 
@@ -430,8 +740,7 @@ class RewardMachine:
         self._idle_surf_entry_ok = True
         self._idle_flash_entry_ok = True
 
-        # HM 사이클 시작 시점의 valid_*_coords_count 스냅샷.
-        # CUT 사이클 시작 시점의 valid_*_coords_count 스냅샷.
+        # HM 사이클 시작 시점의 valid_*_coords_count 스냅샷 (CUT/SURF/FLASH).
         # *_MON_SELECTED / *_BAG_OPEN → SUCCESS 조건:
         #   이 사이클에서 실제로 새 성공이 있어야 함 (에피소드 누적 True 방지).
         # used_*_successfully는 에피소드 전체에서 True로 유지되므로
@@ -477,7 +786,7 @@ class RewardMachine:
             self._idle_cut_entry_ok = True
         if context.is_surfing:
             self._idle_surf_entry_ok = False
-        elif context.tile_in_front != SURF_TILE_IN_FRONT or not context.can_use_surf:
+        elif not context.surf_detect_ok or not context.can_use_surf:
             self._idle_surf_entry_ok = True
         if not context.in_dark_cave or not context.can_use_flash:
             self._idle_flash_entry_ok = True
@@ -504,11 +813,17 @@ class RewardMachine:
         if (
             self.state
             in {
+                RewardMachineState.CUT_START_MENU,
                 RewardMachineState.CUT_MENU_OPEN,
+                RewardMachineState.CUT_PARTY_MENU,
                 RewardMachineState.CUT_MON_SELECTED,
+                RewardMachineState.SURF_START_MENU,
                 RewardMachineState.SURF_MENU_OPEN,
+                RewardMachineState.SURF_PARTY_MENU,
                 RewardMachineState.SURF_MON_SELECTED,
+                RewardMachineState.FLASH_START_MENU,
                 RewardMachineState.FLASH_MENU_OPEN,
+                RewardMachineState.FLASH_PARTY_MENU,
                 RewardMachineState.FLASH_MON_SELECTED,
             }
             and (
@@ -532,13 +847,20 @@ class RewardMachine:
         if self.state != previous_state:
             self._steps_in_state = 0
             self._invalid_increase_counter = 0
-            if previous_state == RewardMachineState.IDLE:
+            if self.state == RewardMachineState.CUT_SUCCESS:
+                # SUCCESS→DONE→IDLE 직후 같은 스냅샷에서 IDLE→SUCCESS 재지급 방지.
+                self._cut_cycle_start_count = context.valid_cut_coords_count
+            elif self.state == RewardMachineState.SURF_SUCCESS:
+                self._surf_cycle_start_count = context.surf_hook_success_count
+            elif self.state == RewardMachineState.FLASH_SUCCESS:
+                self._flash_cycle_start_count = context.valid_flash_coords_count
+            elif previous_state == RewardMachineState.IDLE:
                 if self.state == RewardMachineState.CUT_DETECTED:
                     self._idle_cut_entry_ok = False
                     self._cut_cycle_start_count = context.valid_cut_coords_count
                 elif self.state == RewardMachineState.SURF_DETECTED:
                     self._idle_surf_entry_ok = False
-                    self._surf_cycle_start_count = context.valid_surf_coords_count
+                    self._surf_cycle_start_count = context.surf_hook_success_count
                 elif self.state == RewardMachineState.FLASH_DETECTED:
                     self._idle_flash_entry_ok = False
                     self._flash_cycle_start_count = context.valid_flash_coords_count
@@ -584,17 +906,32 @@ class RewardMachine:
         self._last_invalid_flash_coords_count = context.invalid_flash_coords_count
 
         # If we've already "succeeded" for the current HM stage, don't count invalids.
-        if self.state in {RewardMachineState.CUT_MENU_OPEN, RewardMachineState.CUT_MON_SELECTED}:
+        if self.state in {
+            RewardMachineState.CUT_START_MENU,
+            RewardMachineState.CUT_MENU_OPEN,
+            RewardMachineState.CUT_PARTY_MENU,
+            RewardMachineState.CUT_MON_SELECTED,
+        }:
             if context.used_cut_successfully:
                 self._invalid_increase_counter = 0
             elif cut_delta > 0:
                 self._invalid_increase_counter += int(cut_delta)
-        elif self.state in {RewardMachineState.SURF_MENU_OPEN, RewardMachineState.SURF_MON_SELECTED}:
+        elif self.state in {
+            RewardMachineState.SURF_START_MENU,
+            RewardMachineState.SURF_MENU_OPEN,
+            RewardMachineState.SURF_PARTY_MENU,
+            RewardMachineState.SURF_MON_SELECTED,
+        }:
             if context.used_surf_successfully:
                 self._invalid_increase_counter = 0
             elif surf_delta > 0:
                 self._invalid_increase_counter += int(surf_delta)
-        elif self.state in {RewardMachineState.FLASH_MENU_OPEN, RewardMachineState.FLASH_MON_SELECTED}:
+        elif self.state in {
+            RewardMachineState.FLASH_START_MENU,
+            RewardMachineState.FLASH_MENU_OPEN,
+            RewardMachineState.FLASH_PARTY_MENU,
+            RewardMachineState.FLASH_MON_SELECTED,
+        }:
             if context.flash_cycle_has_new_success:
                 self._invalid_increase_counter = 0
             elif flash_delta > 0:
@@ -622,18 +959,37 @@ class RewardMachine:
                     and not self._idle_flash_entry_ok
                 ):
                     continue
-            # → SURF_SUCCESS: is_surfing은 물 위 매 스텝 True라서 단독으로 쓰면 폭주.
-            # valid_surf_coords_count 증분(실제 surf_hook 발화)이 있어야만 SUCCESS 허용.
+            # → SURF_SUCCESS: IDLE에서 is_surfing만으로는 매 스텝 지급 → 훅·사이클 가드.
             if (
                 transition.target == RewardMachineState.SURF_SUCCESS
-                and context.valid_surf_coords_count <= self._surf_cycle_start_count
+                and transition.source == RewardMachineState.IDLE
+                and context.surf_hook_success_count <= self._surf_cycle_start_count
             ):
                 continue
-            # → CUT_SUCCESS: DETECTED 지름길은 이번 사이클에서 새 valid_cut만 인정.
+            if (
+                transition.target == RewardMachineState.SURF_SUCCESS
+                and transition.source
+                in {
+                    RewardMachineState.SURF_DETECTED,
+                    RewardMachineState.SURF_MENU_OPEN,
+                    RewardMachineState.SURF_PARTY_MENU,
+                    RewardMachineState.SURF_MON_SELECTED,
+                }
+                and context.surf_hook_success_count <= self._surf_cycle_start_count
+                and context.surf_hook_success_delta <= 0
+            ):
+                continue
+            if (
+                transition.target == RewardMachineState.CUT_SUCCESS
+                and transition.source == RewardMachineState.IDLE
+                and context.valid_cut_coords_count <= self._cut_cycle_start_count
+            ):
+                continue
             if (
                 transition.target == RewardMachineState.CUT_SUCCESS
                 and transition.source == RewardMachineState.CUT_DETECTED
                 and context.valid_cut_coords_count <= self._cut_cycle_start_count
+                and context.valid_cut_coords_delta <= 0
             ):
                 continue
             if transition.condition(context):

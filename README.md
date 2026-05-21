@@ -1,16 +1,26 @@
 # Pokemon Red Skills RL
 
-PufferLib 기반 Pokemon Red 강화학습 베이스. 본 저장소는 Reward Machine 상태 신호와 HM Head를 PPO 정책에 함께 주입합니다:
+PufferLib 기반 Pokemon Red 강화학습. Reward Machine + HM Head를 PPO에 함께 넣습니다.
 
-- `Reward Machine` → `rm_state`, `hm_target`, `rm_reward`
-- `Encoder (CNN/Conv/MLP)` 입력: 화면/RAM observation + `rm_state` embedding
-- `Encoder` → 특징 벡터 `z`
-- `HM Head (MLP)` → `hm_logits` (4차원: `cut, surf, flash, none`)
-- `z_aug = concat(z, α · hm_probs)` → PPO Policy 입력
-- 고정 `Action Map (4×7)`로부터 `action_bias = β · (hm_probs @ ActionMap)`
-- `final_action_logits = action_logits + action_bias` → softmax → 행동
-- `shaped_reward = env_reward + rm_reward` → PPO update
-- `hm_aux_loss = CE(hm_logits, hm_supervision_target)`는 `train.hm_aux_loss_coef`로 약하게 보조 학습
+## 신호 흐름
+
+- **Obs**: `rm_state`, `tile_in_front`, `menu_flags`, `party_*`, `hm_aux_label`, (옵션) `screen`
+- **PPO 보상**: `rm_reward` + `step_penalty` + `invalid_action` + `unnecessary_hm_penalty`
+- **메뉴 액션 마스킹**: RM 메뉴 단계에서는 유효 액션을 제한합니다.
+  - `*_START_MENU`: `B` 또는 `down`/`up`만 허용
+  - `*_MENU_OPEN`/`*_PARTY_MENU`/`*_MON_SELECTED`: `B` 또는 `A`만 허용
+  - 일반 `start_menu`가 열린 동안에도 동일 hard mask를 적용합니다 (`menu_flags.start_menu`는 지속 상태).
+- **HM 보조**: `hm_aux_loss` (CE on `hm_aux_label`; coef는 `train.hm_head.aux_ce`)
+- **스토리 진행**: `required_events` + swarm/sqlite (dense event 보상은 없음)
+
+## Surf / 파도타기 (에이전트 학습)
+
+환경은 **물 타일 앞에서 메뉴를 자동으로 열어 주지 않습니다.** 에이전트가 Start → 포켓몬 → Surf까지 직접 입력해야 합니다.
+
+- **`tile_in_front`**, **`rm_state`**, **`hm_aux_label`** (RM이 Surf 단계면 surf), HM action bias가 신호를 줍니다.
+- **`rm_intermediate`** (`config.yaml`): 메뉴 중간 전이(`*_menu_open`, `*_party_menu`, `*_mon_selected`) shaping. 기본 **0.25** 권장.
+- **`rm_surf_success`**: 실제 서핑 성공 시 큰 보상.
+- **`auto_use_surf: true`**: 방향키로 인접 물을 향할 때만 환경이 Surf 매크로 실행 — **학습 우회**이므로 기본은 `false`.
 
 ## 설치
 
@@ -18,103 +28,81 @@ PufferLib 기반 Pokemon Red 강화학습 베이스. 본 저장소는 Reward Mac
 pip3 install -e .
 ```
 
-ROM 파일 `red.gb`는 별도로 준비해 프로젝트 루트에 둡니다.
+ROM `red.gb` (또는 `training1.gb`)를 프로젝트 루트에 둡니다.
 
 ## 실행
 
 ```sh
-# 환경 자동 튜닝 (적절한 num_envs 추정)
 python3 -m pokemonred_puffer.train autotune
-
-# 학습 시작
 python3 -m pokemonred_puffer.train train
-
-# 디버그 모드
+python3 -m pokemonred_puffer.train train --profile train_fast                  # 디스크·save_state 경량화
+python3 -m pokemonred_puffer.train train --profile train_more_rm_intermediate # rm_intermediate↑
 python3 -m pokemonred_puffer.train --config config.yaml --debug
 ```
 
-## Reward Machine
+## Reward Machine 보상 (3단계)
 
-`pokemonred_puffer/rewards/reward_machine.py`는 진행 상태를 다음과 같이 나눕니다:
+`rewards/baseline.py` — 전이 키별 PPO 지급:
 
-```text
-초기 상태: IDLE
+| 구분 | 전이 예 | config |
+|------|---------|--------|
+| 무음 (0) | `*_detected`, `*_start_menu`, `*_done`, `*_aborted` | — |
+| 중간 | `*_menu_open`, `*_party_menu`, `*_mon_selected` | `rm_intermediate` |
+| 성공 | `*_success` | `rm_cut_success`, `rm_surf_success`, `rm_flash_success` |
 
-CUT_DETECTED -> CUT_MENU_OPEN -> CUT_MON_SELECTED -> CUT_SUCCESS
-FLASH_DETECTED -> FLASH_MENU_OPEN -> FLASH_MON_SELECTED -> FLASH_SUCCESS
-SURF_DETECTED -> SURF_MENU_OPEN -> SURF_MON_SELECTED -> SURF_SUCCESS
-SURF_SUCCESS -> IDLE
-
-IDLE/각 HM 단계에서 진행이 멈추면(특히 *_MENU_OPEN 계열에서 N스텝 정체
-또는 잘못된 HM 시도 누적) `FAILED`로 전이
-
-FAILED
-```
-
-전이 조건은 이벤트 플래그, 가방 아이템, 파티 HM 보유 여부, HM 사용 성공 기록을 사용합니다. `rm_state`와 `hm_target`은 observation에 들어가며, `rm_reward`는 기존 reward dict에 누적값으로 합산됩니다.
+**HM 라벨**: `reward_machine.hm_target` → obs `hm_aux_label`. `hm_supervision_proactive: false` 권장.
 
 ## HM Action Map
 
-환경 action 순서는 `[down, left, right, up, A, B, Start]`입니다. Action Map은 이 순서에 맞춰 고정됩니다:
+액션 순서: `[down, left, right, up, A, B, Start]`
 
 ```text
-cut       -> A
-surf      -> A
-flash     -> Start
-none      -> no bias
+cut   -> A
+surf  -> A
+flash -> Start
+none  -> (bias 없음)
 ```
 
-기본 설정값은 `config.yaml`에 있습니다:
+## config.yaml 예시
 
 ```yaml
-train:
-  hm_aux_loss_coef: 0.02
+env:
+  auto_use_surf: false
 
 rewards:
   baseline.ObjectRewardRequiredEventsMapIdsFieldMoves:
     reward:
       rm_enabled: true
-      rm_transition: 5.0
+      rm_intermediate: 0.25
+      rm_cut_success: 2.5
+      rm_surf_success: 1.8
+      rm_flash_success: 0.7
+      hm_supervision_proactive: false
+      hm_supervision_latch_steps: 8
 
-policies:
-  multi_convolutional.MultiConvolutionalPolicy:
-    policy:
-      hm_feature_alpha_init: 0.1
+train:
+  hm_head:
+    aux_ce: 0.01
 ```
 
-## 디렉터리 구조
+## 디렉터리
 
 ```
 pokemonred_puffer/
-├── data/                    # 게임 데이터(이벤트, 아이템, 맵, 기술 등)
-├── policies/
-│   └── multi_convolutional.py   # PPO 정책 (Encoder + HM Head + Actor/Value)
-├── rewards/
-│   ├── baseline.py              # 활성 보상 클래스 체인
-│   └── reward_machine.py        # Reward Machine 상태/전이/HM target
-├── wrappers/
-│   ├── episode_stats.py         # 에피소드 통계 로깅
-│   ├── exploration.py           # 탐험 보상 감쇠/리셋
-│   ├── async_io.py              # 비동기 상태 동기화 (선택)
-│   └── sqlite.py                # SQLite 상태 아카이브 (선택)
-├── environment.py               # RedGymEnv 본체
-├── cleanrl_puffer.py            # PPO 트레이너
-├── train.py                     # 학습 entrypoint
-├── eval.py                      # 글로벌 맵 오버레이 시각화
-├── global_map.py                # 칸토 글로벌 좌표 변환
-├── profile.py                   # 학습 프로파일링
-├── c_gae.pyx                    # GAE Cython 구현
-├── kanto_map_dsv.png            # 칸토 글로벌 맵 이미지
-├── map_data.json                # 맵 좌표/메타데이터
-└── pokered.sym                  # PyBoy 심볼 테이블
+├── environment.py          # PyBoy, obs
+├── cleanrl_puffer.py       # PPO
+├── train.py
+├── policies/multi_convolutional.py
+├── rewards/baseline.py     # RM payout
+├── rewards/reward_machine.py
+└── wrappers/
 ```
 
 ## 변경 가이드
 
-- 하이퍼파라미터: `config.yaml` 직접 편집
-- 보상 변경: `rewards/baseline.py`에 새 클래스 추가 후 `config.yaml.rewards`에 등록
-- 정책 변경: `policies/`에 새 모듈 추가 후 `config.yaml.policies`에 등록
-- 래퍼 변경: `wrappers/`에 새 모듈 추가 후 `config.yaml.wrappers`에 등록
+- 하이퍼파라미터 / 프로필: `config.yaml`, `profiles.*`, `--profile`
+- 보상: `rewards/baseline.py` + `config.yaml` `rewards`
+- 정책: `policies/` + `config.yaml` `policies`
 
 ## 원작자
 

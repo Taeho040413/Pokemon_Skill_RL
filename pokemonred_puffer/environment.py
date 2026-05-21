@@ -1,9 +1,8 @@
 import io
-import json
 import os
 import random
-import time
 from abc import abstractmethod
+from ctypes import c_uint8
 from collections import deque
 from multiprocessing import Lock, shared_memory
 from pathlib import Path
@@ -50,15 +49,23 @@ from pokemonred_puffer.rewards.reward_machine import (
     DARK_CAVE_MAP_PAL_OFFSET,
     HMTarget,
     RewardMachineState,
+    START_MENU_POKEMON_CURSOR,
     SURF_TILE_IN_FRONT,
 )
 
+# wJoyIgnore 해제 루프 상한 (구 1000 → SPS·정지 방지).
+_JOY_IGNORE_DISMISS_MAX = 32
+
 PIXEL_VALUES = np.array([0, 85, 153, 255], dtype=np.uint8)
-HM_SCREEN_CROP_SHAPE = (48, 48, 1)
 # wTileMap 상 플레이어 기준 (cut_if_next 등과 동일). 8방 단일 타일 ID (순서: 상·하·좌·우·좌상·우상·좌하·우하).
 NEAR_TILE_PLAYER_ROW = 8
 NEAR_TILE_PLAYER_COL = 8
 NEAR_TILE_MEMORY_DIM = 8
+MENU_FLAGS_DIM = 5  # start, pokemon, bag, stats, illegal_nav (per-step hooks + latch)
+UI_LOCK_DIM = 3  # joy_ignore, font_loaded, in_battle
+PARTY_HM_CAP_SHAPE = (6, 3)  # 슬롯별 cut/surf/flash 기술 보유 (0/1)
+MAX_PARTY_SIZE = 6
+MAX_ENEMY_PARTY_SIZE = 6
 
 
 VALID_ACTIONS = [
@@ -71,6 +78,8 @@ VALID_ACTIONS = [
     WindowEvent.PRESS_BUTTON_START,
 ]
 
+VALID_ACTIONS_STR = ["down", "left", "right", "up", "a", "b", "start"]
+
 VALID_RELEASE_ACTIONS = [
     WindowEvent.RELEASE_ARROW_DOWN,
     WindowEvent.RELEASE_ARROW_LEFT,
@@ -80,30 +89,6 @@ VALID_RELEASE_ACTIONS = [
     WindowEvent.RELEASE_BUTTON_B,
     WindowEvent.RELEASE_BUTTON_START,
 ]
-
-VALID_ACTIONS_STR = ["down", "left", "right", "up", "a", "b", "start"]
-DEBUG_LOG_PATH = "/home/pnudtn06/yuntaeho/poke_skills/.cursor/debug-d00070.log"
-DEBUG_SESSION_ID = "d00070"
-DEBUG_RUN_ID = "pre-fix"
-
-
-def _append_debug_log(
-    hypothesis_id: str, location: str, message: str, data: dict[str, Any]
-) -> None:
-    try:
-        payload = {
-            "sessionId": DEBUG_SESSION_ID,
-            "runId": DEBUG_RUN_ID,
-            "hypothesisId": hypothesis_id,
-            "location": location,
-            "message": message,
-            "data": data,
-            "timestamp": int(time.time() * 1000),
-        }
-        with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as debug_log_file:
-            debug_log_file.write(json.dumps(payload, default=str) + "\n")
-    except OSError:
-        pass
 
 ACTION_SPACE = spaces.Discrete(len(VALID_ACTIONS))
 
@@ -177,6 +162,10 @@ class RedGymEnv(Env):
         self.infinite_money = env_config.infinite_money
         self.infinite_health = env_config.infinite_health
         self.use_global_map = env_config.use_global_map
+        # False면 screen/hm_screen은 0으로만 넣고 픽셀 전처리 생략 (RM·타일·메뉴 obs로 학습).
+        self.include_screen_obs = bool(
+            OmegaConf.select(env_config, "include_screen_obs", default=True)
+        )
         self.save_state = env_config.save_state
         self.animate_scripts = env_config.animate_scripts
         self.exploration_inc = env_config.exploration_inc
@@ -211,7 +200,7 @@ class RedGymEnv(Env):
             v: i for i, v in enumerate([40, 0, 12, 1, 13, 51, 2, 54, 14, 59, 60, 61, 15, 3, 65])
         }
 
-        # 관측은 screen·방향·가방·파티·RM·주변 타일·HM 크롭·맵 ID 중심 (이벤트 bit열·visited_mask 등 제외).
+        # 관측: 방향·가방·파티·RM·주변 타일·메뉴·맵 ID (+ 옵션 screen).
         obs_dict = {
             "screen": spaces.Box(low=0, high=255, shape=self.screen_output_shape, dtype=np.uint8),
             # Discrete은 맞지만 pufferlib에서 Discrete 처리가 느려 Box로 둔다.
@@ -221,6 +210,7 @@ class RedGymEnv(Env):
                 low=0, high=max(Items._value2member_map_.keys()), shape=(20,), dtype=np.uint8
             ),
             "bag_quantity": spaces.Box(low=0, high=100, shape=(20,), dtype=np.uint8),
+            "party_count": spaces.Box(low=0, high=6, shape=(1,), dtype=np.uint8),
             "species": spaces.Box(low=0, high=0xBE, shape=(6,), dtype=np.uint8),
             "hp": spaces.Box(low=0, high=714, shape=(6,), dtype=np.uint32),
             "status": spaces.Box(low=0, high=7, shape=(6,), dtype=np.uint8),
@@ -232,15 +222,25 @@ class RedGymEnv(Env):
             "rm_state": spaces.Box(
                 low=0, high=len(RewardMachineState) - 1, shape=(1,), dtype=np.uint8
             ),
-            "hm_supervision_target": spaces.Box(
+            # HM aux CE 전용. 액션 직전 래치(스텝 시작 시점) — 메뉴/타일 obs와 동시에 주면 hm_accuracy가 과장됨.
+            "hm_aux_label": spaces.Box(
                 low=0, high=int(HMTarget.NONE), shape=(1,), dtype=np.uint8
             ),
             "near_tile": spaces.Box(
                 low=0, high=255, shape=(NEAR_TILE_MEMORY_DIM,), dtype=np.uint8
             ),
-            "hm_screen": spaces.Box(
-                low=0, high=255, shape=HM_SCREEN_CROP_SHAPE, dtype=np.uint8
+            # 이번 에이전트 스텝에서 훅으로 관측된 메뉴 (스텝 시작 시 0으로 리셋 후 run_action).
+            "menu_flags": spaces.Box(low=0, high=1, shape=(MENU_FLAGS_DIM,), dtype=np.uint8),
+            # 파티 6슬롯 × (cut, surf, flash) 보유 여부 — HM 타워 상황 인식용.
+            "party_hm_cap": spaces.Box(
+                low=0, high=1, shape=PARTY_HM_CAP_SHAPE, dtype=np.uint8
             ),
+            # wTileInFrontOfPlayer — UsedCut/RM CUT·SURF 판정과 동일 (wTileMap 파생 아님).
+            "tile_in_front": spaces.Box(low=0, high=255, shape=(1,), dtype=np.uint8),
+            # wCurrentMenuItem — 스타트/파티/필드기술 커서 (메뉴 닫힘 시 0 근처).
+            "current_menu_item": spaces.Box(low=0, high=255, shape=(1,), dtype=np.uint8),
+            # wJoyIgnore / wFontLoaded / wIsInBattle — 대화·텍스트·전투 중 입력 잠금.
+            "ui_lock": spaces.Box(low=0, high=1, shape=(UI_LOCK_DIM,), dtype=np.uint8),
         }
 
         if self.use_global_map:
@@ -248,6 +248,8 @@ class RedGymEnv(Env):
                 low=0, high=255, shape=self.global_map_shape, dtype=np.uint8
             )
         self.observation_space = spaces.Dict(obs_dict)
+        if not self.include_screen_obs:
+            self._zero_screen_obs = np.zeros(self.screen_output_shape, dtype=np.uint8)
 
         self.pyboy = PyBoy(
             str(env_config.gb_path),
@@ -285,6 +287,49 @@ class RedGymEnv(Env):
         if self.save_video:
             self.video_dir.mkdir(parents=True, exist_ok=True)
         self.init_mem()
+        self._cache_wram_addresses()
+
+    def _cache_wram_addresses(self) -> None:
+        """symbol_lookup는 초기화 시 1회만. 스텝마다 반복 호출하면 SPS가 크게 떨어진다."""
+        lu = self.pyboy.symbol_lookup
+
+        def addr(name: str) -> int:
+            return lu(name)[1]
+
+        self._ram = {
+            "wBagItems": addr("wBagItems"),
+            "wNumBagItems": addr("wNumBagItems"),
+            "wMapPalOffset": addr("wMapPalOffset"),
+            "wPlayerMoney": addr("wPlayerMoney"),
+            "wRepelRemainingSteps": addr("wRepelRemainingSteps"),
+            "wPartyCount": addr("wPartyCount"),
+            "wPartyMons": addr("wPartyMons"),
+            "wTileMap": addr("wTileMap"),
+            "wTileInFrontOfPlayer": addr("wTileInFrontOfPlayer"),
+            "wCurrentMenuItem": addr("wCurrentMenuItem"),
+            "wSpritePlayerStateData1FacingDirection": addr(
+                "wSpritePlayerStateData1FacingDirection"
+            ),
+        }
+        self._flags_start = addr("wStatusFlags1")
+        self._flags_end = addr("wElite4Flags") + 1
+        self._event_flags_start = EVENT_FLAGS_START
+        self._event_flags_end = EVENT_FLAGS_START + EVENTS_FLAGS_LENGTH
+        self._missable_start = 0xD5A6
+        self._missable_end = 0xD5A6 + 32
+
+    def _refresh_game_state_objects(self) -> None:
+        """EventFlags/Flags/Party 재생성 대신 WRAM만 갱신."""
+        self.events.asbytes = (c_uint8 * 320)(
+            *self.pyboy.memory[self._event_flags_start : self._event_flags_end]
+        )
+        self.missables.asbytes = (c_uint8 * 32)(
+            *self.pyboy.memory[self._missable_start : self._missable_end]
+        )
+        self.flags.asbytes = (c_uint8 * 13)(
+            *self.pyboy.memory[self._flags_start : self._flags_end]
+        )
+        self.party.refresh(self.pyboy)
 
     def register_hooks(self):
         self.pyboy.hook_register(None, "DisplayStartMenu", self.start_menu_hook, None)
@@ -300,6 +345,9 @@ class RedGymEnv(Env):
         ):
             self.pyboy.hook_register(None, _lbl, self.start_menu_non_pokemon_branch_hook, None)
         self.pyboy.hook_register(None, "StartMenu_Pokemon.choseStats", self.chose_stats_hook, None)
+        self.pyboy.hook_register(
+            None, "DisplayFieldMoveMonMenu", self.field_move_menu_hook, None
+        )
         self.pyboy.hook_register(None, "StartMenu_Item.choseItem", self.chose_item_hook, None)
         self.pyboy.hook_register(None, "DisplayTextID.spriteHandling", self.sprite_hook, None)
         self.pyboy.hook_register(
@@ -395,10 +443,13 @@ class RedGymEnv(Env):
             #  self.pyboy.tick(seed, render=False)
         self.reset_count += 1
 
-        self.events = EventFlags(self.pyboy)
-        self.missables = MissableFlags(self.pyboy)
-        self.flags = Flags(self.pyboy)
-        self.party = PartyMons(self.pyboy)
+        if not hasattr(self, "party"):
+            self.events = EventFlags(self.pyboy)
+            self.missables = MissableFlags(self.pyboy)
+            self.flags = Flags(self.pyboy)
+            self.party = PartyMons(self.pyboy)
+        else:
+            self._refresh_game_state_objects()
         self.required_events = self.get_required_events()
         self.required_items = self.get_required_items()
         self.seen_pokemon = np.zeros(152, dtype=np.uint8)
@@ -436,12 +487,6 @@ class RedGymEnv(Env):
         self.current_event_flags_set = {}
 
         self.action_hist = np.zeros(len(VALID_ACTIONS))
-        self._debug_prev_coords = self.get_game_coords()
-        self._debug_stationary_steps = 0
-        self._debug_logged_stationary = False
-        self._debug_last_action = None
-        self._debug_same_action_streak = 0
-        self._debug_last_joy_ignore_loops = 0
 
         self.max_map_progress = 0
         self.progress_reward = self.get_game_state_reward()
@@ -449,6 +494,7 @@ class RedGymEnv(Env):
         self.total_reward = sum(self.progress_reward.values())
 
         self.first = False
+        self._hm_aux_label_for_obs = int(HMTarget.NONE)
 
         return self._get_obs(), infos
 
@@ -468,6 +514,8 @@ class RedGymEnv(Env):
 
         self.valid_surf_coords = {}
         self.invalid_surf_coords = {}
+        # RM 가드용: 동일 좌표 재서핑도 훅 발화마다 증가 (len(valid_surf_coords)는 고유 좌표만).
+        self._surf_hook_success_count = 0
 
         self.valid_flash_coords = {}
         self.invalid_flash_coords = {}
@@ -475,6 +523,8 @@ class RedGymEnv(Env):
         self.seen_hidden_objs = {}
         self.seen_signs = {}
 
+        # 스타트 메뉴가 현재 열려 있는지(지속 상태). 훅으로 켜고 CloseStartMenu에서 끈다.
+        self._start_menu_open = False
         # 스타트 메뉴에서 ITEM/도감 등 포켓몬 외 하위 메뉴로 진입했을 때 True (배틀 제외).
         # RM용 seen_* 플래그와 달리 에피소드 동안 유지되며, CloseStartMenu·메인 메뉴 복귀 훅으로 해제된다.
         self._start_menu_illegal_navigation = False
@@ -484,64 +534,47 @@ class RedGymEnv(Env):
         self.seen_stats_menu = 0
         self.seen_bag_menu = 0
         self.seen_action_bag_menu = 0
+        self.seen_field_move_menu = 0
         self.pokecenter_heal = 0
         self.use_ball_count = 0
 
     def reset_mem(self):
+        self._start_menu_open = False
         self._start_menu_illegal_navigation = False
         self.seen_start_menu = 0
         self.seen_pokemon_menu = 0
         self.seen_stats_menu = 0
         self.seen_bag_menu = 0
         self.seen_action_bag_menu = 0
+        self.seen_field_move_menu = 0
         self.pokecenter_heal = 0
         self.use_ball_count = 0
         # 에피소드마다 필드무브 시도/성공 추적을 비워 훅·통계가 리셋 후 깨끗이 쌓이게 함.
-        # (reward_machine 진입은 «플레이어 앞 타일» 판단을 near_tile/wTileMap와 동일 소스로 통일.)
+        # tile_in_front / RM / cut_hook → wTileInFrontOfPlayer. near_tile → wTileMap 8방.
         self.cut_tiles = {}
         self.surf_tiles = {}
         self.valid_cut_coords = {}
         self.invalid_cut_coords = {}
         self.valid_surf_coords = {}
         self.invalid_surf_coords = {}
+        self._surf_hook_success_count = 0
         self.valid_flash_coords = {}
         self.invalid_flash_coords = {}
 
     def render(self) -> npt.NDArray[np.uint8]:
         return self.screen.ndarray[:, :, 1]
 
-    def _extract_hm_screen_crop(
-        self, frame: npt.NDArray[np.uint8], center_y: int | None = None, center_x: int | None = None
-    ) -> npt.NDArray[np.uint8]:
-        crop_h, crop_w, _ = HM_SCREEN_CROP_SHAPE
-        center_y = frame.shape[0] // 2 if center_y is None else center_y
-        center_x = frame.shape[1] // 2 if center_x is None else center_x
-        start_y = center_y - crop_h // 2
-        start_x = center_x - crop_w // 2
-        end_y = start_y + crop_h
-        end_x = start_x + crop_w
-
-        pad_top = max(0, -start_y)
-        pad_left = max(0, -start_x)
-        pad_bottom = max(0, end_y - frame.shape[0])
-        pad_right = max(0, end_x - frame.shape[1])
-        if pad_top or pad_left or pad_bottom or pad_right:
-            frame = np.pad(
-                frame,
-                ((pad_top, pad_bottom), (pad_left, pad_right), (0, 0)),
-                mode="edge",
-            )
-            start_y += pad_top
-            end_y += pad_top
-            start_x += pad_left
-            end_x += pad_left
-        return frame[start_y:end_y, start_x:end_x, :].astype(np.uint8, copy=False)
-
     def screen_obs(self):
-        """전역 화면 + HM 크롭 (+ 옵션 global_map). visited_mask는 관측에서 제외."""
-        raw_screen = np.expand_dims(self.screen.ndarray[:, :, 1], axis=-1)
-        hm_screen = self._extract_hm_screen_crop(raw_screen)
-        game_pixels_render = raw_screen
+        """화면 (+ 옵션 global_map). include_screen_obs=False면 0 텐서만 반환."""
+        if not self.include_screen_obs:
+            out: dict[str, npt.NDArray[np.uint8]] = {
+                "screen": self._zero_screen_obs,
+            }
+            if self.use_global_map:
+                out["global_map"] = np.zeros(self.global_map_shape, dtype=np.uint8)
+            return out
+
+        game_pixels_render = np.expand_dims(self.screen.ndarray[:, :, 1], axis=-1)
 
         if self.reduce_res:
             game_pixels_render = game_pixels_render[::2, ::2, :]
@@ -580,7 +613,6 @@ class RedGymEnv(Env):
 
         out: dict[str, npt.NDArray[np.uint8]] = {
             "screen": game_pixels_render,
-            "hm_screen": hm_screen,
         }
         if self.use_global_map and global_map is not None:
             out["global_map"] = global_map
@@ -588,8 +620,8 @@ class RedGymEnv(Env):
 
     def _get_obs(self):
         # player_x, player_y, map_n = self.get_game_coords()
-        _, wBagItems = self.pyboy.symbol_lookup("wBagItems")
-        bag = np.array(self.pyboy.memory[wBagItems : wBagItems + 40], dtype=np.uint8)
+        w_bag = self._ram["wBagItems"]
+        bag = np.array(self.pyboy.memory[w_bag : w_bag + 40], dtype=np.uint8)
         numBagItems = self.read_m("wNumBagItems")
         # item ids start at 1 so using 0 as the nothing value is okay
         bag[2 * numBagItems :] = 0
@@ -603,19 +635,28 @@ class RedGymEnv(Env):
                 "map_id": np.array([self.read_m(0xD35E)], dtype=np.uint8),
                 "bag_items": bag[::2].copy(),
                 "bag_quantity": bag[1::2].copy(),
-                "species": np.array([self.party[i].Species for i in range(6)], dtype=np.uint8),
+                **self._party_slot_obs(),
                 "hp": np.array([self.party[i].HP for i in range(6)], dtype=np.uint32),
                 "status": np.array([self.party[i].Status for i in range(6)], dtype=np.uint8),
                 "type1": np.array([self.party[i].Type1 for i in range(6)], dtype=np.uint8),
                 "type2": np.array([self.party[i].Type2 for i in range(6)], dtype=np.uint8),
                 "level": np.array([self.party[i].Level for i in range(6)], dtype=np.uint8),
                 "maxHP": np.array([self.party[i].MaxHP for i in range(6)], dtype=np.uint32),
-                "moves": np.array([self.party[i].Moves for i in range(6)], dtype=np.uint8),
                 "rm_state": np.array([self.get_reward_machine_state_id()], dtype=np.uint8),
-                "hm_supervision_target": np.array(
-                    [self.get_hm_supervision_target_id()], dtype=np.uint8
+                "hm_aux_label": np.array(
+                    [int(getattr(self, "_hm_aux_label_for_obs", int(HMTarget.NONE)))],
+                    dtype=np.uint8,
                 ),
                 "near_tile": self.get_near_tile_memory_8(),
+                "menu_flags": self._menu_flags_obs(),
+                "tile_in_front": np.array(
+                    [self.get_tile_in_front_of_player()], dtype=np.uint8
+                ),
+                "current_menu_item": np.array(
+                    [self.get_current_menu_item()], dtype=np.uint8
+                ),
+                "ui_lock": self._ui_lock_obs(),
+                "party_hm_cap": self.get_party_hm_cap_obs(),
             }
         )
 
@@ -626,45 +667,47 @@ class RedGymEnv(Env):
             self.pyboy.memory[addr + 17 : addr + 17 + 12] = 0xFF
 
     def check_if_party_has_hm(self, hm: int) -> bool:
-        party_size = self.read_m("wPartyCount")
+        party_size = self._clamp_party_count()
         for i in range(party_size):
-            # PRET 1-indexes
-            _, addr = self.pyboy.symbol_lookup(f"wPartyMon{i+1}Moves")
-            if hm in self.pyboy.memory[addr : addr + 4]:
+            if hm in self.party[i].Moves:
                 return True
         return False
 
     def step(self, action):
-        _, wMapPalOffset = self.pyboy.symbol_lookup("wMapPalOffset")
-        if self.auto_flash and self.pyboy.memory[wMapPalOffset] == DARK_CAVE_MAP_PAL_OFFSET:
-            self.pyboy.memory[wMapPalOffset] = 0
+        # HM aux 라벨: BaselineRewardEnv.step 에서 refresh (기회 타일 vs RM 메뉴 단계).
+        if not hasattr(self, "refresh_hm_aux_label_for_obs"):
+            self._hm_aux_label_for_obs = self.get_hm_supervision_target_id()
+
+        w_map_pal = self._ram["wMapPalOffset"]
+        if self.auto_flash and self.pyboy.memory[w_map_pal] == DARK_CAVE_MAP_PAL_OFFSET:
+            self.pyboy.memory[w_map_pal] = 0
 
         if self.auto_remove_all_nonuseful_items:
             self.remove_all_nonuseful_items()
 
-        _, wPlayerMoney = self.pyboy.symbol_lookup("wPlayerMoney")
+        w_player_money = self._ram["wPlayerMoney"]
         if (
             self.infinite_money
-            and int.from_bytes(self.pyboy.memory[wPlayerMoney : wPlayerMoney + 3], "little") < 10000
+            and int.from_bytes(
+                self.pyboy.memory[w_player_money : w_player_money + 3], "little"
+            )
+            < 10000
         ):
-            self.pyboy.memory[wPlayerMoney : wPlayerMoney + 3] = int(10000).to_bytes(3, "little")
+            self.pyboy.memory[w_player_money : w_player_money + 3] = int(10000).to_bytes(
+                3, "little"
+            )
 
         if (
             self.disable_wild_encounters
             and MapIds(self.blackout_check).name not in self.disable_wild_encounters_maps
         ):
-            self.pyboy.memory[self.pyboy.symbol_lookup("wRepelRemainingSteps")[1]] = 0xFF
-
-        self.check_num_bag_items()
+            self.pyboy.memory[self._ram["wRepelRemainingSteps"]] = 0xFF
 
         # update the a press before we use it so we dont trigger the font loaded early return
         if VALID_ACTIONS[action] == WindowEvent.PRESS_BUTTON_A:
             self.update_a_press()
         self.run_action_on_emulator(action)
-        self.events = EventFlags(self.pyboy)
-        self.missables = MissableFlags(self.pyboy)
-        self.flags = Flags(self.pyboy)
-        self.party = PartyMons(self.pyboy)
+        self._refresh_game_state_objects()
         self.update_health()
         self.update_pokedex()
         self.update_tm_hm_obtained_move_ids()
@@ -674,59 +717,10 @@ class RedGymEnv(Env):
         # RewardMachineContext.is_surfing이 같은 스텝의 wWalkBikeSurfState와 일치한다.
         self.use_surf = 1 if self.read_m("wWalkBikeSurfState") == 0x2 else 0
         new_reward = self.update_reward()
+        if hasattr(self, "refresh_hm_aux_label_for_obs"):
+            self.refresh_hm_aux_label_for_obs()
         self.last_health = self.read_hp_fraction()
         self.update_map_progress()
-        current_coords = self.get_game_coords()
-        if self._debug_last_action == int(action):
-            self._debug_same_action_streak += 1
-        else:
-            self._debug_same_action_streak = 1
-        self._debug_last_action = int(action)
-        if current_coords == self._debug_prev_coords:
-            self._debug_stationary_steps += 1
-        else:
-            self._debug_stationary_steps = 0
-            self._debug_logged_stationary = False
-        if self._debug_stationary_steps >= 64 and not self._debug_logged_stationary:
-            # region agent log
-            _append_debug_log(
-                "H1",
-                "pokemonred_puffer/environment.py:step",
-                "stationary movement streak",
-                {
-                    "step_count": int(self.step_count),
-                    "coords": tuple(int(v) for v in current_coords),
-                    "action": VALID_ACTIONS_STR[int(action)],
-                    "same_action_streak": int(self._debug_same_action_streak),
-                    "stationary_steps": int(self._debug_stationary_steps),
-                    "near_tile": self.get_near_tile_memory_8().tolist(),
-                    "use_surf": int(self.use_surf),
-                    "reward_sum": float(sum(self.progress_reward.values())),
-                },
-            )
-            # endregion
-            # region agent log
-            _append_debug_log(
-                "H2,H3",
-                "pokemonred_puffer/environment.py:step",
-                "stationary control state",
-                {
-                    "step_count": int(self.step_count),
-                    "coords": tuple(int(v) for v in current_coords),
-                    "joy_ignore_loops": int(self._debug_last_joy_ignore_loops),
-                    "seen_start_menu": int(self.seen_start_menu),
-                    "seen_pokemon_menu": int(self.seen_pokemon_menu),
-                    "seen_bag_menu": int(self.seen_bag_menu),
-                    "seen_stats_menu": int(self.seen_stats_menu),
-                    "seen_action_bag_menu": int(self.seen_action_bag_menu),
-                    "rm_state": int(self.get_reward_machine_state_id()),
-                    "hm_target": int(self.get_reward_machine_hm_target_id()),
-                    "hm_supervision_target": int(self.get_hm_supervision_target_id()),
-                },
-            )
-            # endregion
-            self._debug_logged_stationary = True
-        self._debug_prev_coords = current_coords
         if self.perfect_ivs:
             self.set_perfect_iv_dvs()
         self.taught_cut = self.check_if_party_has_hm(TmHmMoves.CUT.value)
@@ -783,39 +777,21 @@ class RedGymEnv(Env):
             self.first = True
 
         if self.save_video:
-            try:
-                ms = self.get_max_steps()
-                tail = max(1, self.video_tail_steps)
-                start_at = max(1, ms - tail + 1)
-                if (
-                    self._episode_video_writer is None
-                    and self.step_count >= start_at
-                ):
-                    self.start_episode_video()
-                if self._episode_video_writer is not None:
-                    self.add_video_frame()
-                if reset:
-                    self._close_episode_video()
-            except Exception as exc:
-                # region agent log
-                _append_debug_log(
-                    "H4",
-                    "pokemonred_puffer/environment.py:step",
-                    "video writer failure",
-                    {
-                        "step_count": int(self.step_count),
-                        "coords": tuple(int(v) for v in self.get_game_coords()),
-                        "error_type": type(exc).__name__,
-                        "error": str(exc),
-                    },
-                )
-                # endregion
-                raise
+            ms = self.get_max_steps()
+            tail = max(1, self.video_tail_steps)
+            start_at = max(1, ms - tail + 1)
+            if self._episode_video_writer is None and self.step_count >= start_at:
+                self.start_episode_video()
+            if self._episode_video_writer is not None:
+                self.add_video_frame()
+            if reset:
+                self._close_episode_video()
 
         return obs, new_reward, reset, False, info
 
-    def run_action_on_emulator(self, action):
-        self.action_hist[action] += 1
+    def run_action_on_emulator(self, action, *, skip_agent_input: bool = False):
+        if not skip_agent_input:
+            self.action_hist[action] += 1
         # 메뉴 플래그를 스텝 시작마다 초기화: 훅이 틱 도중에 1로 설정하므로
         # "이번 스텝에서 해당 메뉴가 실제로 열렸는가"를 정확히 반영한다.
         # 에피소드 내 누적(sticky)이 되면 RM 메뉴 전이가 무조건 통과돼 리워드 해킹으로 이어진다.
@@ -824,24 +800,24 @@ class RedGymEnv(Env):
         self.seen_bag_menu = 0
         self.seen_stats_menu = 0
         self.seen_action_bag_menu = 0
+        self.seen_field_move_menu = 0
 
-        if not self.disable_ai_actions:
+        if not skip_agent_input and not self.disable_ai_actions:
             self.pyboy.send_input(VALID_ACTIONS[action])
             self.pyboy.send_input(VALID_RELEASE_ACTIONS[action], delay=8)
-        self.pyboy.tick(self.action_freq - 1, render=False)
+            self.pyboy.tick(self.action_freq - 1, render=False)
+        else:
+            self.pyboy.tick(self.action_freq, render=False)
 
         # TODO: Split this function up. update_seen_coords should not be here!
         self.update_seen_coords()
 
         # DO NOT DELETE. Some animations require dialog navigation
-        joy_ignore_loops = 0
-        for _ in range(1000):
+        for _ in range(_JOY_IGNORE_DISMISS_MAX):
             if not self.read_m("wJoyIgnore"):
                 break
-            joy_ignore_loops += 1
             self.pyboy.button("a", 8)
             self.pyboy.tick(self.action_freq, render=False)
-        self._debug_last_joy_ignore_loops = joy_ignore_loops
 
         if self.events.get_event("EVENT_GOT_HM01"):
             if self.auto_use_cut:
@@ -869,15 +845,21 @@ class RedGymEnv(Env):
         # One last tick just in case
         self.pyboy.tick(1, render=True)
 
-    def party_has_cut_capable_mon(self):
-        # find bulba and replace tackle (first skill) with cut
+    def party_has_cut_capable_mon(self) -> bool:
+        """CUT RM·리셋 가드용. RewardMachineContext.can_use_cut(has_cut)과 동일 기준 우선.
+
+        예전에는 CUT 배울 수 있는 *종*만 검사해서, 영상/테스트용으로 파티를 줄이면
+        CUT을 이미 쓰고 있어도 매 스텝 reset → rm_* 카운트가 0으로만 보였다.
+        """
         party_size = self.read_m("wPartyCount")
+        if party_size == 0:
+            return False
+        if self.check_if_party_has_hm(TmHmMoves.CUT.value):
+            return True
+        if Items.HM_01 not in self.get_items_in_bag():
+            return False
         for i in range(party_size):
-            # PRET 1-indexes
-            _, species_addr = self.pyboy.symbol_lookup(f"wPartyMon{i+1}Species")
-            poke = self.pyboy.memory[species_addr]
-            # https://github.com/pret/pokered/blob/d38cf5281a902b4bd167a46a7c9fd9db436484a7/constants/pokemon_constants.asm
-            if poke in CUT_SPECIES_IDS:
+            if self.party[i].Species in CUT_SPECIES_IDS:
                 return True
         return False
 
@@ -981,6 +963,64 @@ class RedGymEnv(Env):
                 self.pyboy.button("A", delay=8)
                 self.pyboy.tick(4 * self.action_freq, self.animate_scripts)
 
+    def _dismiss_joy_ignore(self) -> None:
+        for _ in range(_JOY_IGNORE_DISMISS_MAX):
+            if not self.read_m("wJoyIgnore"):
+                break
+            self.pyboy.button("a", 8)
+            self.pyboy.tick(self.action_freq, self.animate_scripts)
+
+    def _execute_surf_menu_sequence(self) -> None:
+        """Start → 포켓몬 → Surf 필드기술 (`auto_use_surf` 전용)."""
+        self._dismiss_joy_ignore()
+        self.pyboy.send_input(WindowEvent.PRESS_BUTTON_START)
+        self.pyboy.send_input(WindowEvent.RELEASE_BUTTON_START, delay=8)
+        self.pyboy.tick(self.action_freq, self.animate_scripts)
+        self._dismiss_joy_ignore()
+
+        for _ in range(24):
+            if self.read_m("wCurrentMenuItem") == START_MENU_POKEMON_CURSOR:
+                break
+            self.pyboy.send_input(WindowEvent.PRESS_ARROW_DOWN)
+            self.pyboy.send_input(WindowEvent.RELEASE_ARROW_DOWN, delay=8)
+            self.pyboy.tick(self.action_freq, self.animate_scripts)
+
+        self.pyboy.send_input(WindowEvent.PRESS_BUTTON_A)
+        self.pyboy.send_input(WindowEvent.RELEASE_BUTTON_A, delay=8)
+        self.pyboy.tick(self.action_freq, self.animate_scripts)
+
+        for _ in range(7):
+            self.pyboy.send_input(WindowEvent.PRESS_ARROW_DOWN)
+            self.pyboy.send_input(WindowEvent.RELEASE_ARROW_DOWN, delay=8)
+            self.pyboy.tick(self.action_freq, self.animate_scripts)
+            party_mon = self.read_m("wCurrentMenuItem")
+            _, addr = self.pyboy.symbol_lookup(f"wPartyMon{party_mon % 6 + 1}Moves")
+            if TmHmMoves.SURF.value in self.pyboy.memory[addr : addr + 4]:
+                break
+
+        self.pyboy.send_input(WindowEvent.PRESS_BUTTON_A)
+        self.pyboy.send_input(WindowEvent.RELEASE_BUTTON_A, delay=8)
+        self.pyboy.tick(4 * self.action_freq, self.animate_scripts)
+
+        _, wFieldMoves = self.pyboy.symbol_lookup("wFieldMoves")
+        field_moves = self.pyboy.memory[wFieldMoves : wFieldMoves + 4]
+        for _ in range(10):
+            current_item = self.read_m("wCurrentMenuItem")
+            if current_item < 4 and field_moves[current_item] in (
+                FieldMoves.SURF.value,
+                FieldMoves.SURF_2.value,
+            ):
+                break
+            self.pyboy.send_input(WindowEvent.PRESS_ARROW_DOWN)
+            self.pyboy.send_input(WindowEvent.RELEASE_ARROW_DOWN, delay=8)
+            self.pyboy.tick(self.action_freq, self.animate_scripts)
+
+        for _ in range(5):
+            self._dismiss_joy_ignore()
+            self.pyboy.send_input(WindowEvent.PRESS_BUTTON_A)
+            self.pyboy.send_input(WindowEvent.RELEASE_BUTTON_A, delay=8)
+            self.pyboy.tick(4 * self.action_freq, self.animate_scripts)
+
     def surf_if_attempt(self, action: WindowEvent):
         if (
             self.read_m("wIsInBattle") == 0
@@ -993,62 +1033,9 @@ class RedGymEnv(Env):
                 WindowEvent.PRESS_ARROW_RIGHT,
                 WindowEvent.PRESS_ARROW_UP,
             ]
+            and self._action_points_to_adjacent_water(action)
         ):
-            if not self._action_points_to_adjacent_water(action):
-                return
-
-            # open start menu
-            self.pyboy.send_input(WindowEvent.PRESS_BUTTON_START)
-            self.pyboy.send_input(WindowEvent.RELEASE_BUTTON_START, delay=8)
-            self.pyboy.tick(self.action_freq, self.animate_scripts)
-            # scroll to pokemon
-            # 1 is the item index for pokemon
-            for _ in range(24):
-                if self.pyboy.memory[self.pyboy.symbol_lookup("wCurrentMenuItem")[1]] == 1:
-                    break
-                self.pyboy.send_input(WindowEvent.PRESS_ARROW_DOWN)
-                self.pyboy.send_input(WindowEvent.RELEASE_ARROW_DOWN, delay=8)
-                self.pyboy.tick(self.action_freq, self.animate_scripts)
-            self.pyboy.send_input(WindowEvent.PRESS_BUTTON_A)
-            self.pyboy.send_input(WindowEvent.RELEASE_BUTTON_A, delay=8)
-            self.pyboy.tick(self.action_freq, self.animate_scripts)
-
-            # find pokemon with surf
-            # We run this over all pokemon so we dont end up in an infinite for loop
-            for _ in range(7):
-                self.pyboy.send_input(WindowEvent.PRESS_ARROW_DOWN)
-                self.pyboy.send_input(WindowEvent.RELEASE_ARROW_DOWN, delay=8)
-                self.pyboy.tick(self.action_freq, self.animate_scripts)
-                party_mon = self.pyboy.memory[self.pyboy.symbol_lookup("wCurrentMenuItem")[1]]
-                _, addr = self.pyboy.symbol_lookup(f"wPartyMon{party_mon%6+1}Moves")
-                if 0x39 in self.pyboy.memory[addr : addr + 4]:
-                    break
-
-            # Enter submenu
-            self.pyboy.send_input(WindowEvent.PRESS_BUTTON_A)
-            self.pyboy.send_input(WindowEvent.RELEASE_BUTTON_A, delay=8)
-            self.pyboy.tick(4 * self.action_freq, self.animate_scripts)
-
-            # Scroll until the field move is found
-            _, wFieldMoves = self.pyboy.symbol_lookup("wFieldMoves")
-            field_moves = self.pyboy.memory[wFieldMoves : wFieldMoves + 4]
-
-            for _ in range(10):
-                current_item = self.read_m("wCurrentMenuItem")
-                if current_item < 4 and field_moves[current_item] in (
-                    FieldMoves.SURF.value,
-                    FieldMoves.SURF_2.value,
-                ):
-                    break
-                self.pyboy.send_input(WindowEvent.PRESS_ARROW_DOWN)
-                self.pyboy.send_input(WindowEvent.RELEASE_ARROW_DOWN, delay=8)
-                self.pyboy.tick(self.action_freq, self.animate_scripts)
-
-            # press a bunch of times
-            for _ in range(5):
-                self.pyboy.send_input(WindowEvent.PRESS_BUTTON_A)
-                self.pyboy.send_input(WindowEvent.RELEASE_BUTTON_A, delay=8)
-                self.pyboy.tick(4 * self.action_freq, self.animate_scripts)
+            self._execute_surf_menu_sequence()
 
     def solve_strength_puzzle(self):
         in_cavern = self.read_m("wCurMapTileset") == Tilesets.CAVERN.value
@@ -1192,11 +1179,13 @@ class RedGymEnv(Env):
 
     def start_menu_hook(self, *args, **kwargs):
         if self.read_m("wIsInBattle") == 0:
+            self._start_menu_open = True
             self.seen_start_menu = 1
             # 메인 일시정지 메뉴(처음 열기 또는 하위 메뉴에서 복귀)에서는 포켓몬 외 분기 패널티 구간 해제.
             self._start_menu_illegal_navigation = False
 
     def close_start_menu_hook(self, *args, **kwargs):
+        self._start_menu_open = False
         self._start_menu_illegal_navigation = False
 
     def is_start_menu_illegal_navigation_active(self) -> bool:
@@ -1205,20 +1194,28 @@ class RedGymEnv(Env):
 
     def start_menu_non_pokemon_branch_hook(self, *args, **kwargs):
         if self.read_m("wIsInBattle") == 0:
+            self._start_menu_open = True
             self._start_menu_illegal_navigation = True
 
     def item_menu_hook(self, *args, **kwargs):
         self.seen_bag_menu = 1
         if self.read_m("wIsInBattle") == 0:
+            self._start_menu_open = True
             self._start_menu_illegal_navigation = True
 
     def pokemon_menu_hook(self, *args, **kwargs):
         if self.read_m("wIsInBattle") == 0:
+            self._start_menu_open = True
             self.seen_pokemon_menu = 1
             self._start_menu_illegal_navigation = False
 
+    def field_move_menu_hook(self, *args, **kwargs):
+        if self.read_m("wIsInBattle") == 0:
+            self.seen_field_move_menu = 1
+
     def chose_stats_hook(self, *args, **kwargs):
         if self.read_m("wIsInBattle") == 0:
+            self._start_menu_open = True
             self.seen_stats_menu = 1
 
     def chose_item_hook(self, *args, **kwargs):
@@ -1266,9 +1263,7 @@ class RedGymEnv(Env):
         if player_direction == 0xC:
             coords = (x + 1, y, map_id)
 
-        wTileInFrontOfPlayer = self.pyboy.memory[
-            self.pyboy.symbol_lookup("wTileInFrontOfPlayer")[1]
-        ]
+        wTileInFrontOfPlayer = self.get_tile_in_front_of_player()
         if context:
             if wTileInFrontOfPlayer in CUTTABLE_TILES:
                 self.valid_cut_coords[coords] = 1
@@ -1287,19 +1282,19 @@ class RedGymEnv(Env):
         x, y, map_id = self.get_game_coords()  # x, y, map_id
         if player_direction == 0:  # down
             coords = (x, y + 1, map_id)
-        if player_direction == 4:
+        elif player_direction == 4:  # up
             coords = (x, y - 1, map_id)
-        if player_direction == 8:
+        elif player_direction == 8:  # left
             coords = (x - 1, y, map_id)
-        if player_direction == 0xC:
+        elif player_direction == 0xC:  # right
             coords = (x + 1, y, map_id)
+        else:
+            coords = (x, y, map_id)
         if context:
             self.valid_surf_coords[coords] = 1
+            self._surf_hook_success_count += 1
         else:
             self.invalid_surf_coords[coords] = 1
-        wTileInFrontOfPlayer = self.pyboy.memory[
-            self.pyboy.symbol_lookup("wTileInFrontOfPlayer")[1]
-        ]
 
     def flash_hook(self, *args, **kwargs):
         """Record Flash usage.
@@ -1338,13 +1333,19 @@ class RedGymEnv(Env):
             self.pyboy.memory[self.pyboy.symbol_lookup("wRepelRemainingSteps")[1]] = 0xFF
             self.pyboy.memory[self.pyboy.symbol_lookup("wCurEnemyLevel")[1]] = 0x01
 
+    def _clamp_party_count(self, count: int | None = None) -> int:
+        if count is None:
+            count = self.read_m("wPartyCount")
+        return min(max(int(count), 0), MAX_PARTY_SIZE)
+
     def agent_stats(self, action):
-        levels = [self.read_m(f"wPartyMon{i+1}Level") for i in range(self.read_m("wPartyCount"))]
-        badges = self.read_m("wObtainedBadges")
+        party_count = self._clamp_party_count()
+        levels = [self.read_m(f"wPartyMon{i+1}Level") for i in range(party_count)]
+        badges = int(self.read_m("wObtainedBadges")) & 0xFF
 
         _, wBagItems = self.pyboy.symbol_lookup("wBagItems")
         bag = np.array(self.pyboy.memory[wBagItems : wBagItems + 40], dtype=np.uint8)
-        numBagItems = self.read_m("wNumBagItems")
+        numBagItems = min(max(self.read_m("wNumBagItems"), 0), MAX_ITEM_CAPACITY)
         # item ids start at 1 so using 0 as the nothing value is okay
         bag[2 * numBagItems :] = 0
         bag_item_ids = bag[::2]
@@ -1359,7 +1360,7 @@ class RedGymEnv(Env):
                 "step": self.step_count + self.reset_count * self.max_steps,
                 "max_map_progress": self.max_map_progress,
                 "last_action": action,
-                "party_count": self.read_m("wPartyCount"),
+                "party_count": party_count,
                 "levels": levels,
                 "levels_sum": sum(levels),
                 "ptypes": self.read_party(),
@@ -1393,11 +1394,16 @@ class RedGymEnv(Env):
                 "invalid_flash_coords": len(self.invalid_flash_coords),
                 "rm_state": self.get_reward_machine_state_id(),
                 "hm_target": self.get_reward_machine_hm_target_id(),
+                "hm_aux_label": int(getattr(self, "_hm_aux_label_for_obs", int(HMTarget.NONE))),
                 "hm_supervision_target": self.get_hm_supervision_target_id(),
                 "rm_transition_count": getattr(self, "rm_transition_count", 0),
                 "rm_reward_total": getattr(self, "rm_reward_total", 0.0),
                 "rm_success_count": getattr(self, "rm_success_count", 0),
                 "rm_cut_success_count": getattr(self, "rm_cut_success_count", 0),
+                "rm_surf_detected_count": getattr(self, "rm_surf_detected_count", 0),
+                "rm_surf_menu_open_count": getattr(self, "rm_surf_menu_open_count", 0),
+                "rm_surf_mon_selected_count": getattr(self, "rm_surf_mon_selected_count", 0),
+                "rm_surf_aborted_count": getattr(self, "rm_surf_aborted_count", 0),
                 "rm_surf_success_count": getattr(self, "rm_surf_success_count", 0),
                 "rm_flash_success_count": getattr(self, "rm_flash_success_count", 0),
                 "rm_intermediate_paid_count": getattr(
@@ -1405,7 +1411,11 @@ class RedGymEnv(Env):
                 ),
                 "rm_reward_from_success": getattr(self, "rm_reward_from_success", 0.0),
                 "rm_transition_reward": getattr(self, "rm_reward_from_intermediate", 0.0),
+                "rm_transition_reward_net": getattr(
+                    self, "rm_reward_intermediate_net", 0.0
+                ),
                 "rm_clawback_total": getattr(self, "rm_clawback_total", 0.0),
+                "rm_clawback_count": getattr(self, "rm_clawback_count", 0),
                 "rm_step_delta": getattr(self, "rm_last_step_delta", 0.0),
                 "last_rm_transition": getattr(self, "last_rm_transition_key", ""),
                 "menu": {
@@ -1506,23 +1516,63 @@ class RedGymEnv(Env):
                 out[i] = tile_map[ry, cx]
         return out
 
+    def _menu_flags_obs(self) -> npt.NDArray[np.uint8]:
+        return np.array(
+            [
+                int(self._start_menu_open),
+                self.seen_pokemon_menu,
+                self.seen_bag_menu,
+                self.seen_stats_menu,
+                int(self.is_start_menu_illegal_navigation_active()),
+            ],
+            dtype=np.uint8,
+        )
+
+    def _ui_lock_obs(self) -> npt.NDArray[np.uint8]:
+        return np.array(
+            [
+                int(self.read_m("wJoyIgnore") != 0),
+                int(self.read_m("wFontLoaded") != 0),
+                int(self.read_m("wIsInBattle") != 0),
+            ],
+            dtype=np.uint8,
+        )
+
     def get_tile_in_front_of_player(self) -> int:
-        """앞쪽 한 칸 타일 ID. ``near_tile``의 상·하·좌·우 중 바라보는 방향에 해당하는 값(wTileMap 동일 소스)."""
-        neighbors = self.get_near_tile_memory_8()
-        d = self.read_m("wSpritePlayerStateData1FacingDirection")
-        # ``surf_if_attempt`` 등과 동일: 아래 0x0, 위 0x4, 왼쪽 0x8, 오른쪽 0xC
-        if d == 0x4:
-            return int(neighbors[0])
-        if d == 0x0:
-            return int(neighbors[1])
-        if d == 0x8:
-            return int(neighbors[2])
-        if d == 0xC:
-            return int(neighbors[3])
-        return int(neighbors[1])
+        """앞칸 타일 ID (WRAM ``wTileInFrontOfPlayer``). obs·RM·cut_hook과 동일 소스."""
+        return int(self.pyboy.memory[self._ram["wTileInFrontOfPlayer"]])
+
+    def get_current_menu_item(self) -> int:
+        """메뉴 커서 (``wCurrentMenuItem``). 스타트 메뉴 포켓몼 줄은 보통 1."""
+        return int(self.pyboy.memory[self._ram["wCurrentMenuItem"]])
+
+    def _party_slot_obs(self) -> dict[str, npt.NDArray[np.uint8]]:
+        """파티 인원·종·4기술(HM 포함). 빈 슬롯은 0으로 마스크."""
+        party_count = self._clamp_party_count()
+        species = np.zeros(6, dtype=np.uint8)
+        moves = np.zeros((6, 4), dtype=np.uint8)
+        for i in range(party_count):
+            species[i] = self.party[i].Species
+            moves[i] = np.array(self.party[i].Moves, dtype=np.uint8)
+        return {
+            "party_count": np.array([party_count], dtype=np.uint8),
+            "species": species,
+            "moves": moves,
+        }
+
+    def get_party_hm_cap_obs(self) -> npt.NDArray[np.uint8]:
+        """슬롯별 cut/surf/flash 기술 보유 (빈 슬롯은 0)."""
+        cap = np.zeros(PARTY_HM_CAP_SHAPE, dtype=np.uint8)
+        party_count = self._clamp_party_count()
+        for i in range(party_count):
+            moves = self.party[i].Moves
+            cap[i, 0] = int(TmHmMoves.CUT.value in moves)
+            cap[i, 1] = int(TmHmMoves.SURF.value in moves)
+            cap[i, 2] = int(TmHmMoves.FLASH.value in moves)
+        return cap
 
     def _supports_surf_tile_scan(self) -> bool:
-        tileset = self.read_m("wCurMapTileset")
+        tileset = self.read_m("wCurMapTileset")  # infrequent; symbol_lookup ok
         in_overworld = tileset == Tilesets.OVERWORLD.value
         in_plateau = tileset == Tilesets.PLATEAU.value
         in_cavern = tileset == Tilesets.CAVERN.value
@@ -1549,6 +1599,22 @@ class RedGymEnv(Env):
             return 0
         return sum(int(SURF_TILE_IN_FRONT in tiles) for tiles in directional_tiles.values())
 
+    def player_faces_adjacent_water(self) -> bool:
+        """바라보는 방향 인접 타일에 물(0x14)이 있으면 True. RM SURF_DETECTED·surf_if_attempt와 동일 기준."""
+        directional_tiles = self._get_adjacent_directional_tiles()
+        if directional_tiles is None:
+            return False
+        direction = self.read_m("wSpritePlayerStateData1FacingDirection")
+        if direction == 0x4:
+            return bool(SURF_TILE_IN_FRONT in directional_tiles["up"])
+        if direction == 0x0:
+            return bool(SURF_TILE_IN_FRONT in directional_tiles["down"])
+        if direction == 0x8:
+            return bool(SURF_TILE_IN_FRONT in directional_tiles["left"])
+        if direction == 0xC:
+            return bool(SURF_TILE_IN_FRONT in directional_tiles["right"])
+        return False
+
     def _action_points_to_adjacent_water(self, action: WindowEvent) -> bool:
         directional_tiles = self._get_adjacent_directional_tiles()
         if directional_tiles is None:
@@ -1556,7 +1622,11 @@ class RedGymEnv(Env):
 
         direction = self.read_m("wSpritePlayerStateData1FacingDirection")
         return bool(
-            (direction == 0x4 and action == WindowEvent.PRESS_ARROW_UP and SURF_TILE_IN_FRONT in directional_tiles["up"])
+            (
+                direction == 0x4
+                and action == WindowEvent.PRESS_ARROW_UP
+                and SURF_TILE_IN_FRONT in directional_tiles["up"]
+            )
             or (
                 direction == 0x0
                 and action == WindowEvent.PRESS_ARROW_DOWN
@@ -1659,8 +1729,12 @@ class RedGymEnv(Env):
 
     def read_m(self, addr: str | int) -> int:
         if isinstance(addr, str):
-            return self.pyboy.memory[self.pyboy.symbol_lookup(addr)[1]]
-        return self.pyboy.memory[addr]
+            val = self.pyboy.memory[self.pyboy.symbol_lookup(addr)[1]]
+        else:
+            val = self.pyboy.memory[addr]
+        if isinstance(val, (bytes, bytearray)):
+            return int(val[0]) if len(val) > 0 else 0
+        return int(val)
 
     def read_short(self, addr: str | int) -> int:
         if isinstance(addr, str):
@@ -1679,10 +1753,12 @@ class RedGymEnv(Env):
     def get_badges(self):
         return self.read_m("wObtainedBadges").bit_count()
 
-    def read_party(self):
+    def read_party(self) -> list[int]:
         _, addr = self.pyboy.symbol_lookup("wPartySpecies")
-        party_length = self.pyboy.memory[self.pyboy.symbol_lookup("wPartyCount")[1]]
-        return self.pyboy.memory[addr : addr + party_length]
+        party_length = self._clamp_party_count()
+        if party_length == 0:
+            return []
+        return [int(x) for x in self.pyboy.memory[addr : addr + party_length]]
 
     @abstractmethod
     def get_game_state_reward(self):
@@ -1708,9 +1784,14 @@ class RedGymEnv(Env):
 
     def update_max_op_level(self):
         # opp_base_level = 5
+        # Defensive clamp: pokered enemy party slots are 1..6.
+        # Some custom/debug states can transiently expose invalid counts (e.g. 7),
+        # which would make symbol lookup request non-existent labels like
+        # `wEnemyMon7Level`.
+        enemy_party_count = min(max(int(self.read_m("wEnemyPartyCount")), 0), MAX_ENEMY_PARTY_SIZE)
         opponent_level = max(
             [0]
-            + [self.read_m(f"wEnemyMon{i+1}Level") for i in range(self.read_m("wEnemyPartyCount"))]
+            + [self.read_m(f"wEnemyMon{i+1}Level") for i in range(enemy_party_count)]
         )
         # - opp_base_level
 
@@ -1741,7 +1822,7 @@ class RedGymEnv(Env):
     def update_tm_hm_obtained_move_ids(self):
         # TODO: Make a hook
         # Scan party
-        for i in range(self.read_m("wPartyCount")):
+        for i in range(self._clamp_party_count()):
             _, addr = self.pyboy.symbol_lookup(f"wPartyMon{i+1}Moves")
             for move_id in self.pyboy.memory[addr : addr + 4]:
                 # if move_id in TM_HM_MOVES:
@@ -1792,7 +1873,7 @@ class RedGymEnv(Env):
             self.pyboy.memory[wListScrollOffset] = 0
 
     def reverse_damage(self):
-        for i in range(self.read_m("wPartyCount")):
+        for i in range(self._clamp_party_count()):
             _, wPartyMonHP = self.pyboy.symbol_lookup(f"wPartyMon{i+1}HP")
             _, wPartymonMaxHP = self.pyboy.symbol_lookup(f"wPartyMon{i+1}MaxHP")
             self.pyboy.memory[wPartyMonHP] = 0
@@ -1801,7 +1882,7 @@ class RedGymEnv(Env):
             self.pyboy.memory[wPartymonMaxHP + 1] = 128
 
     def read_hp_fraction(self):
-        party_size = self.read_m("wPartyCount")
+        party_size = self._clamp_party_count()
         hp_sum = sum(self.read_short(f"wPartyMon{i+1}HP") for i in range(party_size))
         max_hp_sum = sum(self.read_short(f"wPartyMon{i+1}MaxHP") for i in range(party_size))
         max_hp_sum = max(max_hp_sum, 1)
@@ -1819,9 +1900,11 @@ class RedGymEnv(Env):
 
     def get_items_in_bag(self) -> Iterable[Items]:
         # Defensive handling for custom/corrupted save states.
-        num_bag_items = min(max(self.read_m("wNumBagItems"), 0), MAX_ITEM_CAPACITY)
+        num_bag_items = min(
+            max(int(self.pyboy.memory[self._ram["wNumBagItems"]]), 0), MAX_ITEM_CAPACITY
+        )
         try:
-            _, addr = self.pyboy.symbol_lookup("wBagItems")
+            addr = self._ram["wBagItems"]
             raw_items = self.pyboy.memory[addr : addr + 2 * num_bag_items][::2]
         except Exception:
             return []
@@ -1861,9 +1944,11 @@ class RedGymEnv(Env):
     def get_required_items(self) -> set[str]:
         # Some custom/debug save states can have transiently invalid bag counters.
         # Clamp to legal bag capacity to avoid out-of-range PyBoy memory slicing.
-        wNumBagItems = min(max(self.read_m("wNumBagItems"), 0), MAX_ITEM_CAPACITY)
+        wNumBagItems = min(
+            max(int(self.pyboy.memory[self._ram["wNumBagItems"]]), 0), MAX_ITEM_CAPACITY
+        )
         try:
-            _, wBagItems = self.pyboy.symbol_lookup("wBagItems")
+            wBagItems = self._ram["wBagItems"]
             bag_items = self.pyboy.memory[wBagItems : wBagItems + wNumBagItems * 2 : 2]
         except Exception:
             # Some handcrafted save states can momentarily expose invalid bag pointers.

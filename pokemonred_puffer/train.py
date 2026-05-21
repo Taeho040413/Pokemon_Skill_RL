@@ -47,7 +47,6 @@ import wandb
 from pokemonred_puffer import cleanrl_puffer
 from pokemonred_puffer.cleanrl_puffer import CleanPuffeRL
 from pokemonred_puffer.environment import RedGymEnv
-from pokemonred_puffer.rewards.reward_machine import HMTarget
 from pokemonred_puffer.wrappers.async_io import AsyncWrapper
 from pokemonred_puffer.wrappers.sqlite import SqliteStateResetWrapper
 
@@ -56,7 +55,8 @@ app = typer.Typer(pretty_exceptions_enable=False)
 DEFAULT_CONFIG = "config.yaml"
 DEFAULT_POLICY = "multi_convolutional.MultiConvolutionalPolicy"
 DEFAULT_REWARD = "baseline.ObjectRewardRequiredEventsMapIdsFieldMoves"
-DEFAULT_WRAPPER = "baseline"
+# HM RM 학습: exploration decay wrapper는 메뉴 shaping과 겹치므로 empty가 기본.
+DEFAULT_WRAPPER = "empty"
 DEFAULT_ROM = "training1.gb"
 # Default run folder: runs/<DEFAULT_EXP_ID>/ (model_*.pt, trainer_state.pt). Override with --exp-name / -e.
 DEFAULT_EXP_ID = "pokeSkill001"
@@ -78,16 +78,14 @@ def make_policy(env: RedGymEnv, policy_name: str, config: DictConfig) -> nn.Modu
     if config.train.use_rnn:
         rnn_config = config.policies[policy_name].rnn
         rnn_args = dict(OmegaConf.to_container(rnn_config.args, resolve=True))
-        # LSTM 입력 = policy trunk(512) + HM softmax(4). config와 어긋나면 evaluate에서 assert 실패.
-        from pokemonred_puffer.policies.multi_convolutional import HM_FEATURE_COUNT
-
+        # LSTM 입력 = z_policy(512). hm_probs는 이미 policy 인코더에 α로 주입됨.
         hidden_size = int(policy_cfg.get("hidden_size", 512))
-        expected_input_size = hidden_size + HM_FEATURE_COUNT
+        expected_input_size = hidden_size
         configured = int(rnn_args.get("input_size", expected_input_size))
         if configured != expected_input_size:
             print(
                 f"[policy] rnn.input_size {configured} -> {expected_input_size} "
-                f"(hidden_size={hidden_size} + HM_FEATURE_COUNT={HM_FEATURE_COUNT})"
+                f"(policy z_policy dim={hidden_size})"
             )
         rnn_args["input_size"] = expected_input_size
         policy_class = getattr(policy_module, rnn_config.name)
@@ -99,13 +97,25 @@ def make_policy(env: RedGymEnv, policy_name: str, config: DictConfig) -> nn.Modu
     return policy.to(config.train.device)
 
 
-def load_from_config(config: DictConfig, debug: bool) -> DictConfig:
+def load_from_config(
+    config: DictConfig,
+    debug: bool,
+    profile: str | None = None,
+) -> DictConfig:
     default_keys = ["env", "train", "policies", "rewards", "wrappers", "wandb"]
     defaults = OmegaConf.create({key: config.get(key, {}) for key in default_keys})
 
-    # Package and subpackage (environment) configs
-    debug_config = config.get("debug", OmegaConf.create({})) if debug else OmegaConf.create({})
+    if profile:
+        profile_cfg = OmegaConf.select(config, f"profiles.{profile}")
+        if profile_cfg is None:
+            known = list(OmegaConf.select(config, "profiles", default={}).keys())
+            raise typer.BadParameter(
+                f"Unknown profile {profile!r}. Available: {known or '(none)'}"
+            )
+        defaults.merge_with(profile_cfg)
+        print(f"[train] merged config profile: {profile}")
 
+    debug_config = config.get("debug", OmegaConf.create({})) if debug else OmegaConf.create({})
     defaults.merge_with(debug_config)
     return defaults
 
@@ -943,11 +953,18 @@ def train(
     ] = Path(DEFAULT_ROM),
     track: Annotated[bool, typer.Option(help="Track on wandb.")] = False,
     debug: Annotated[bool, typer.Option(help="debug")] = False,
+    profile: Annotated[
+        str | None,
+        typer.Option(
+            "--profile",
+            help="Merge config.yaml profiles.<name> over env/train (e.g. train_fast).",
+        ),
+    ] = None,
     vectorization: Annotated[
         Vectorization, typer.Option(help="Vectorization method")
     ] = "multiprocessing",
 ):
-    config = load_from_config(config, debug)
+    config = load_from_config(config, debug, profile=profile)
     config.vectorization = vectorization
     config, env_creator = setup(
         config=config,
@@ -1041,6 +1058,14 @@ def train(
                         trainer.train()
                 except KeyboardInterrupt:
                     print("KeyboardInterrupt received. Saving checkpoint and stopping training...")
+                except Exception:
+                    print(
+                        "[train] Training stopped due to an unhandled exception "
+                        "(see traceback above).",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    raise
 
         print("Done training")
 

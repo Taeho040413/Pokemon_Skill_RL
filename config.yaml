@@ -1,3 +1,6 @@
+# =============================================================================
+# Weights & Biases
+# =============================================================================
 wandb:
   entity: TestRedRl
   project: Red_skill
@@ -5,220 +8,155 @@ wandb:
   base_url: https://api.wandb.ai
 
 
+# =============================================================================
+# Environment (RedGymEnv)
+# =============================================================================
 env:
-  # If true, run without rendering every step.
-  headless: True
-  # Directory to store video output.
-  video_dir: video
-  # Directory with pyboy save states to load from.
-  state_dir: pyboy_states
-  # File within state dir to load from.
-  init_state: training1
-  # How many ticks each environment step should take.
-  action_freq: 24
-  # Maximum number of steps per mini-episode.
-  max_steps: 12000
-  # If true, save videos.
-  save_video: True
-  # If true, save sped up videos.
-  fast_video: True
-  # Number of environments to save videos for.
-  n_record: 4
-  # 에피소드 종료 직전 이 스텝 수만큼만 MP4에 기록 (그 이전 구간은 미기록).
-  video_tail_steps: 3000
-  # If true, give all party members max base stats.
-  perfect_ivs: False
-  # If true, downsample the screen observation by 2.
-  reduce_res: True
-  # If true, losslessy compress the screen observation.
-  two_bit: False
-  # How many steps until the environment returns an info.
+  # --- Runtime ---
+  headless: true
+  disable_ai_actions: false          # true: 에이전트 입력 끔 (디버그)
+  animate_scripts: false             # 스크립트 연출 (obs에는 미포함)
+  action_freq: 24                    # 환경 1 step당 에뮬 tick 수
+  max_steps: 8000
   log_frequency: 2000
-  # If true, disable the need for Flash.
-  auto_flash: False
-  # If true, disable wild encounters with repels.
-  disable_wild_encounters: False
-  # If true, disable AI input. Useful for debugging.
-  disable_ai_actions: False
-  # If true, teach cut if possible.
-  auto_teach_cut: False
-  # If true, use cut when standing next to a tree.
-  auto_use_cut: False
-  # If true, use strength when walking into a cave if possible.
-  auto_use_strength: False
-  # If true, use surf when attempting to walk on water.
-  auto_use_surf: False
-  # If true, teach surf if possible.
-  auto_teach_surf: False
-  # If true, teach strength if possible.
-  auto_teach_strength: False
-  # If true, solve a strength puzzle if next to a moveable boulder.
-  auto_solve_strength_puzzles: True
-  # If true, toss all unneeded items when the bag is full.
-  auto_remove_all_nonuseful_items: True
-  # If true, go to the next floor module num floors when entering an elevator.
-  auto_next_elevator_floor: False
-  # If true, place a Lemonade in the player's bag if there is no Lemonade when
-  # in the Celadon Mart.
-  insert_saffron_guard_drinks: False
-  # If true, give the player infinite money.
-  infinite_money: True
-  # If true, all Party Pokemon will have a fixed HP of 128.
-  infinite_health: False
-  # If true, use the global map observation.
-  use_global_map: False
-  # If true, provide the PyBoy save state as a part of infos.
-  save_state: True
-  # If true, animate scripts. Script animations will not be a part of obs.
-  # This flag is good for debugging.
-  animate_scripts: False
-  # The value on the exploration map for visiting a new coordinate.
-  exploration_inc: 1.0
-  # The max possible value on the exploration map.
-  exploration_max: 1.0
-  # The amount to scale max steps by. Will be multiplied by the number of required items and events.
-  max_steps_scaling: 0 # 0.2 # every 10 events or items gained, multiply max_steps by 2
-  # The scaling for visiting important map IDs.
-  map_id_scalefactor: 9.539340019226074 # multiply map ids whose events have not been completed by 10
-  # How many agents must reach a required event before all agents are allowed to continue.
-  # If an agent reaches a milestone and the required tolerance is not met, the episode will reset. 
-  required_tolerance: null
-  # required_tolerance: 0.02
 
+  # --- Init / state ---
+  state_dir: pyboy_states
+  init_state: training3
+  save_state: true                   # info에 PyBoy save state 포함
+  perfect_ivs: false
+  infinite_money: true
+  infinite_health: false
+
+  # --- Observation ---
+  reduce_res: true
+  two_bit: false
+  use_global_map: false
+  include_screen_obs: true           # false: screen=0, CNN 생략 (타일·메뉴·파티 중심)
+  exploration_inc: 1.0
+  exploration_max: 1.0
+  map_id_scalefactor: 9.539340019226074
+  max_steps_scaling: 0               # required 진행에 따라 max_steps 스케일 (0=끔)
+
+  # --- Video ---
+  save_video: true
+  fast_video: true
+  video_dir: video
+  n_record: 3
+  video_tail_steps: 2500             # 에피소드 끝 N step만 MP4에 기록
+
+  # --- Wild / QoL ---
+  disable_wild_encounters: false
+  auto_flash: false
+  auto_remove_all_nonuseful_items: true
+  auto_next_elevator_floor: false
+  insert_saffron_guard_drinks: false
+
+  # --- HM: teach / auto-use ---
+  auto_teach_cut: false
+  auto_use_cut: false
+  auto_teach_surf: false
+  auto_use_surf: false              # true면 방향키로 인접 물 향할 때 환경이 Surf 매크로 실행 (학습 우회)
+  auto_teach_strength: false
+  auto_use_strength: false
+  auto_solve_strength_puzzles: false
+
+  # --- Multi-agent sync ---
+  required_tolerance: null           # 마일스톤 동기화 허용 비율 (null=끔)
+
+
+# =============================================================================
+# Training (CleanPuffeRL / PPO)
+# =============================================================================
 train:
-  # Random seed
   seed: 1
-  # Use deterministic Torch algorithms
-  torch_deterministic: True
-  # If true, merge train.cuda when GPU is available, else train.cpu (device picked automatically).
-  # Set false to use only train.device below (no cuda/cpu profiles).
+  torch_deterministic: true
+  verbose: true
+  data_dir: runs
+
+  # --- Device (auto_device=true면 cpu/cuda 프로필이 아래 기본값을 덮음) ---
   auto_device: true
-  # Fallback / label when auto_device is false; ignored when auto_device is true (replaced by profile).
-  device: cpu
-  # When auto_device is true and no CUDA: merged into train.* (vector counts, device, backends, …).
+  device: auto                       # auto_device=false일 때만 사용
   cpu:
     device: cpu
     num_envs: 96
     num_workers: 8
     env_batch_size: 36
-    zero_copy: False
-  # When auto_device is true and CUDA: merged into train.* (autotune-friendly vec + PyTorch backends).
+    zero_copy: false
   cuda:
     device: cuda
-    num_envs: 192
+    num_envs: 384
     num_workers: 32
     env_batch_size: 36
-    zero_copy: False
+    zero_copy: false
     cudnn_benchmark: null
     cudnn_deterministic: null
     matmul_allow_tf32: null
     cudnn_allow_tf32: null
-  # If true, use torch.compile
-  compile: True
-  # The mode for torch compilation
-  compile_mode: "reduce-overhead"
-  # Mostly useless for Pokemon, enables tensor cores on NVIDIA GPUs.
-  float32_matmul_precision: "high"
-  # The total time steps to run training for.
-  total_timesteps: 10_000_000_000 # 100_000_000_000 for full games
-  # The number of examples for one epoch of training.
-  batch_size: 65536
-  # The number of example to train for one batch of training.
-  minibatch_size: 2048
-  # If true, turn on learning rate annealing.
-  anneal_lr: False
-  # Unused
-  num_minibatches: 4
-  # Number of epochs when training.
-  update_epochs: 3
-  # If true, use normalized advantage.
-  norm_adv: True
-  # Entropy coefficient. 너무 낮으면 메인 액션이 한 키로 붕괴하기 쉬움.
-  ent_coef: 0.028
-  # Generalized advantage estimate
-  gae_lambda: 0.949936199629264
-  # Decay parameter for advantage estimation.
-  gamma: 0.9979900678597386
-  # How strongly to clip gradients.
-  # PPO trust region; 너무 좁으면 clipfrac 지표만 부풀고 업데이트가 잘림 (일반적으로 0.1–0.2).
-  clip_coef: 0.15
-  clip_vloss: True
-  # Learning rate.
-  learning_rate: 0.0001
-  # Max norm of the gradients
-  max_grad_norm: 0.5
-  target_kl: 0.01
-  vf_clip_coef: 0.1
-  vf_coef: 0.5319333384064214
-  # unused
-  batch_rows: 128
-  # backprop through time horizon.
-  bptt_horizon: 16
-
-  # When auto_device is true, train.cpu / train.cuda override these. When false, profiles are ignored — these are used.
+  # auto_device=false 또는 프로필 미적용 시 사용
   num_envs: 192
   num_workers: 32
   env_batch_size: 36
-  zero_copy: False
-  # Use PufferLib EnvPool
-  env_pool: True
+  zero_copy: false
+  env_pool: true
+  cpu_offload: false
 
-  # Verbose terminal reporting.
-  verbose: True
-  # Directory to store checkpoints in.
-  data_dir: runs
-  # If true, save checkpoints.
-  save_checkpoint: False
-  # How often to save checkpoints.
+  # --- Torch compile ---
+  compile: true
+  compile_mode: reduce-overhead
+  float32_matmul_precision: high
+
+  # --- Rollout / batch ---
+  total_timesteps: 10_000_000_000
+  batch_size: 65536
+  minibatch_size: 2048
+  num_minibatches: 4                 # unused
+  batch_rows: 128                    # unused
+  bptt_horizon: 16
+  update_epochs: 4
+
+  # --- PPO ---
+  learning_rate: 0.0003
+  anneal_lr: false
+  gamma: 0.99
+  gae_lambda: 0.92
+  norm_adv: true
+  adv_scale: 1.2
+  clip_coef: 0.2
+  clip_vloss: true
+  vf_coef: 0.7
+  vf_clip_coef: 0.1
+  ent_coef: 0.028
+  max_grad_norm: 0.5
+  target_kl: 0.02
+
+  # --- Network ---
+  use_rnn: true
+
+  # --- Checkpoint ---
+  save_checkpoint: false
   checkpoint_interval: 200
 
-  # (disabled) Log global map overlay to wandb
-  # Use PufferLib's CPU data offloading.
-  cpu_offload: False
-  # Use RNN network. False is not supported
-  use_rnn: True
-  # Use multiprocessing to asynchronously reset the agents
-  # when required new events and items are observed.
-  async_wrapper: False
-  # Use a shared SQLite DB to reset the agents
-  # when required new events and items are observed.
-  sqlite_wrapper: True
-  # Save PyBoy states when new required events and items are observed.
-  # When True, creates a timestamped folder (e.g. 20260504-162205) in cwd each run.
-  archive_states: False
-  # When a new required events and items are observed, move
-  # all environments to the save state for the environment that made 
-  # the observation
-  swarm: True
-  # event name: minutes. If we dont satisfy each condition
-  # we early stop
-  # The defaults have a margin of error
-  early_stop:
-    EVENT_BEAT_BROCK: 30
-    EVENT_BEAT_MISTY: 300
-    EVENT_GOT_HM01: 600
-    EVENT_BEAT_LT_SURGE: 1200
-  # If set, train until all events are accomplished.
-  one_epoch:
-    - "EVENT_BEAT_CHAMPION_RIVAL"
-    # - HM_03
-    # - HM_04
-    # - "EVENT_BEAT_ERIKA"
-  # If true, provide the percentage completion rate for required
-  # items to the environments.
-  required_rate: False
+  # --- Swarm / reset wrappers ---
+  async_wrapper: false
+  sqlite_wrapper: true
+  archive_states: false
+  swarm: true
+  required_rate: false
+  early_stop: {}
+  one_epoch: []
 
-  # HM 분류 헤드 보조항목 (PPO loss에 합산). 라벨은 obs hm_supervision_target(래치).
+  # --- HM classification head (보조 CE; 라벨 obs hm_aux_label) ---
   hm_head:
-    aux_ce: 0.03 # HM CE 가중치 (비-NONE 라벨)
-    none_ce: 0.07 # NONE(IDLE) 라벨 CE 추가 가중 (CUT 붕괴 완화)
-    label_smoothing: 0.0 # CE 라벨 스무딩; 보통 0
-    entropy_bonus: 0.01 # HM softmax 엔트로피 장려; 끄려면 0
+    aux_ce: 0.01                     # 낮을수록 actor gradient 덜 잠식
+    none_ce: 0.0
+    label_smoothing: 0.0
+    entropy_bonus: 0.01
 
-# Wrappers to use for training.
-# Each wrapper is keyed by a name for the commandline.
-# The value for each key is the list of wrappers to support.
-# Wrappers can be found in the wrappers directory.
+
+# =============================================================================
+# Wrappers (train CLI에서 선택)
+# =============================================================================
 wrappers:
   empty:
     - episode_stats.EpisodeStatsWrapper: {}
@@ -241,100 +179,135 @@ wrappers:
         jitter: 0
     - episode_stats.EpisodeStatsWrapper: {}
 
-# Rewards to use for training.
-# Each reward is keyed by a name for the commandline.
-# The value for each key is the list of rewards to support.
-# Rewards can be found in the rewards directory.
+
+# =============================================================================
+# Rewards (train CLI에서 선택)
+# =============================================================================
 rewards:
   baseline.ObjectRewardRequiredEventsMapIdsFieldMoves:
     reward:
+      # Reward machine (3단계: 무음 전이 / rm_intermediate / rm_*_success)
       rm_enabled: true
-      # HM 시도가 중단(aborted)·메뉴 타임아웃(rm_failed_timeout)·플래시 동굴 이탈 등으로 끝나면,
-      # 그 시도 동안 쌓인 rm_transition 보상만 되돌림(+n 후 −n).
+      rm_max_transitions_per_step: 3
+      rm_intermediate: 0.5             # Cut/Surf/Flash 공통: 메뉴 체인 중간 전이 보상 기본값 (키별 override 가능)
       rm_clawback_intermediate_on_abort: true
-      rm_transition: 0.3
-      rm_cut_success: 1.2
-      rm_surf_success: 0.9
-      rm_flash_success: 0.5 #1.0
-      step_penalty: 0.00018
-      # Cut/Surf 시도했으나 무효(맨땅·잘못된 타일 등): invalid_cut/surf 좌표 증가당 -계수.
-      unnecessary_hm_usage_penalty: 0.13
-      # 스타트 메뉴에서 포켓몬이 아닌 분기(가방·도감·트레이너·저장·설정)에 들어간 뒤 매 스텝 패널티.
-      invalid_menu_navigation_penalty: 0.0003
+      rm_clawback_fraction: 0.9
+      hm_supervision_proactive: false    # true면 타일만 봐도 surf 라벨 (CE 100% 붕괴)
+      hm_supervision_latch_steps: 8      # RM hm_target 없을 때 라벨 유지
+
+      rm_cut_success: 3.1
+      rm_surf_success: 2.1
+      rm_flash_success: 1.5
+      # 선택: 키별 중간 보상 (없으면 rm_intermediate)
+      # rm_surf_menu_open: 0.35
+      # rm_surf_party_menu: 0.25
+      # rm_surf_mon_selected: 0.35
+
+      # Shaping / penalties
+      step_penalty: 0.0
+      unnecessary_hm_usage_penalty: 0.02
 
 
-# Policies to use for training.
-# Each policy is keyed by a name for the commandline.
-# The value for each key is the list of policies to support.
-# Policies can be found in the policies directory.
+# =============================================================================
+# Policies (train CLI에서 선택)
+# =============================================================================
 policies:
   multi_convolutional.MultiConvolutionalPolicy:
     policy:
       hidden_size: 512
+      hm_latent_size: 256
       rm_state_embedding_dim: 4
       hm_hidden_size: 128
       hm_feature_alpha_init: 0.1
-
+      hm_action_beta_init: 0.1
+      hm_menu_action_beta_init: 0.08
     rnn:
-      # Assumed to be in the same module as the policy
       name: MultiConvolutionalRNN
       args:
-        # encode_linear_policy(512) + hm_probs(HM_FEATURE_COUNT=4). 예전 pokeflute 5클래스는 517.
-        input_size: 516
+        input_size: 512
         hidden_size: 512
         num_layers: 1
 
-# Debug overrides.
+
+# =============================================================================
+# Profiles (train --profile <name> 시 env/train 덮어씀, debug보다 먼저)
+# =============================================================================
+profiles:
+  # 디스크·save_state 부담 줄임 (SPS는 주로 PyBoy tick·num_envs)
+  train_fast:
+    env:
+      save_video: false
+      n_record: 0
+      save_state: false
+    train:
+      save_checkpoint: false
+
+  # rm_intermediate만 더 크게 (메뉴 탐험 유도)
+  train_more_rm_intermediate:
+    rewards:
+      baseline.ObjectRewardRequiredEventsMapIdsFieldMoves:
+        reward:
+          rm_intermediate: 0.35
+
+
+# =============================================================================
+# Debug overrides (train --debug 시 env/train 위 값 덮어씀)
+# =============================================================================
 debug:
   env:
-    headless: False
+    # runtime
+    headless: false
     init_state: training3
     state_dir: pyboy_states
     max_steps: 19000
     log_frequency: 1
-    disable_ai_actions: True
-    use_global_map: False
-    reduce_res: True
-    animate_scripts: True
-    save_state: False
-    save_video: True
+    disable_ai_actions: true
+    animate_scripts: true
+    save_state: false
+    # observation
+    use_global_map: false
+    reduce_res: true
+    two_bit: false
+    # video
+    save_video: true
+    fast_video: false
     video_tail_steps: 2000
-    fast_video: False
-    auto_flash: False
-    disable_wild_encounters: True
-    auto_teach_cut: False
-    auto_use_cut: False
-    auto_use_strength: False
-    auto_use_surf: False
-    auto_teach_surf: False
-    auto_teach_strength: False
-    auto_solve_strength_puzzles: False
-    auto_remove_all_nonuseful_items: False
-    auto_next_elevator_floor: False
-    infinite_health: True
-    insert_saffron_guard_drinks: False
-    perfect_ivs: False
-    two_bit: False
+    # wild / QoL
+    disable_wild_encounters: true
+    auto_flash: false
+    auto_remove_all_nonuseful_items: false
+    auto_next_elevator_floor: false
+    insert_saffron_guard_drinks: false
+    infinite_health: true
+    perfect_ivs: false
+    # HM automation
+    auto_teach_cut: false
+    auto_use_cut: false
+    auto_teach_surf: false
+    auto_use_surf: false
+    auto_teach_strength: false
+    auto_use_strength: false
+    auto_solve_strength_puzzles: false
+
   train:
     device: cpu
-    compile: False
+    compile: false
     compile_mode: default
     num_envs: 1
     envs_per_worker: 1
     num_workers: 1
     env_batch_size: 128
-    zero_copy: False
+    zero_copy: false
     batch_size: 1024
     minibatch_size: 128
     batch_rows: 4
     bptt_horizon: 2
     total_timesteps: 1_000_000
-    save_checkpoint: True
+    save_checkpoint: true
     checkpoint_interval: 4
-    # (disabled) save_overlay / overlay_interval removed
-    verbose: True
-    env_pool: False
-    load_optimizer_state: False
-    async_wrapper: False
-    sqlite_wrapper: False
-    archive_states: False
+    verbose: true
+    env_pool: false
+    load_optimizer_state: false
+    async_wrapper: false
+    sqlite_wrapper: false
+    archive_states: false

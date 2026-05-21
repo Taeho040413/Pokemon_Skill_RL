@@ -20,6 +20,9 @@ from pokemonred_puffer.rewards.reward_machine import (
 # 헬퍼
 # ─────────────────────────────────────────────────────────────────
 _CUT_TILE = next(iter(CUTTABLE_TILES))  # 0x3D
+_START_MENU = dict(start_menu_open=True, current_menu_item=1)
+_PARTY_MENU = dict(pokemon_menu_open=True, field_move_menu_open=False)
+_FIELD_MENU = dict(pokemon_menu_open=True, field_move_menu_open=True)
 
 
 def _ctx(**overrides) -> RewardMachineContext:
@@ -31,15 +34,16 @@ def _ctx(**overrides) -> RewardMachineContext:
         got_hm05=False, beat_rocket_hideout_giovanni=False,
         beat_route12_snorlax=False, beat_route16_snorlax=False,
         got_hm03=False, beat_koga=False,
-        has_cut=False, has_flash=False, has_surf=False,
         auto_flash=False,
-        used_cut_successfully=False, valid_cut_coords_count=0,
-        valid_surf_coords_count=0, valid_flash_coords_count=0,
+        used_cut_successfully=False, valid_cut_coords_count=0, valid_cut_coords_delta=0,
+        valid_surf_coords_count=0, valid_surf_coords_delta=0,
+        surf_hook_success_count=0, surf_hook_success_delta=0,
+        valid_flash_coords_count=0, valid_flash_coords_delta=0,
         used_surf_successfully=False, is_surfing=False,
         tile_in_front=0x00,
+        faces_adjacent_water=False,
         start_menu_open=False, pokemon_menu_open=False,
-        invalid_cut_coords_count=0,
-        start_menu_open=False, pokemon_menu_open=False, bag_menu_open=False,
+        field_move_menu_open=False, current_menu_item=0,
         invalid_cut_coords_count=0,
         invalid_surf_coords_count=0, invalid_flash_coords_count=0,
         in_dark_cave=False, flash_cycle_has_new_success=False,
@@ -66,39 +70,65 @@ class TestCut:
         assert s.changed and rm.state == RewardMachineState.CUT_DETECTED
         assert s.transition_key == "rm_cut_detected"
 
-        # CUT_DETECTED → CUT_MENU_OPEN
-        s = _step(rm, 1, has_cut=True, tile_in_front=_CUT_TILE, start_menu_open=True)
+        # CUT_DETECTED → CUT_MENU_OPEN (포켓몬 줄)
+        s = _step(
+            rm,
+            1,
+            has_cut=True,
+            tile_in_front=_CUT_TILE,
+            start_menu_open=True,
+            current_menu_item=1,
+        )
         assert rm.state == RewardMachineState.CUT_MENU_OPEN
         assert s.transition_key == "rm_cut_menu_open"
 
-        # CUT_MENU_OPEN → CUT_MON_SELECTED
-        s = _step(rm, 2, has_cut=True, tile_in_front=_CUT_TILE, pokemon_menu_open=True)
+        # CUT_MENU_OPEN → CUT_PARTY_MENU
+        s = _step(
+            rm,
+            2,
+            has_cut=True,
+            tile_in_front=_CUT_TILE,
+            pokemon_menu_open=True,
+            field_move_menu_open=False,
+        )
+        assert rm.state == RewardMachineState.CUT_PARTY_MENU
+        assert s.transition_key == "rm_cut_party_menu"
+
+        # CUT_PARTY_MENU → CUT_MON_SELECTED
+        s = _step(
+            rm,
+            3,
+            has_cut=True,
+            tile_in_front=_CUT_TILE,
+            pokemon_menu_open=True,
+            field_move_menu_open=True,
+        )
         assert rm.state == RewardMachineState.CUT_MON_SELECTED
         assert s.transition_key == "rm_cut_mon_selected"
 
         # CUT_MON_SELECTED → CUT_SUCCESS (새 cut 성공 + tile이 사라짐)
-        s = _step(rm, 3, has_cut=True, tile_in_front=0x00,
-                  used_cut_successfully=True, valid_cut_coords_count=1)
+        s = _step(
+            rm,
+            4,
+            has_cut=True,
+            tile_in_front=0x00,
+            used_cut_successfully=True,
+            valid_cut_coords_count=1,
+        )
         assert rm.state == RewardMachineState.CUT_SUCCESS
         assert s.transition_key == "rm_cut_success"
 
         # CUT_SUCCESS → IDLE
-        s = _step(rm, 4)
+        s = _step(rm, 5)
         assert rm.state == RewardMachineState.IDLE
         assert s.transition_key == "rm_cut_done"
 
     def test_chains_menu_states_same_snapshot(self):
         """Baseline과 같이 transition을 연속 호출하면 한 스냅샷에서 메뉴 전이가 모두 적용된다."""
         rm = RewardMachine()
-        ctx = _ctx(
-            step_count=1,
-            has_cut=True,
-            tile_in_front=_CUT_TILE,
-            start_menu_open=True,
-            pokemon_menu_open=True,
-        )
+        ctx = _ctx(step_count=1, has_cut=True, tile_in_front=_CUT_TILE, **_START_MENU, **_FIELD_MENU)
         keys: list[str | None] = []
-        for _ in range(5):
+        for _ in range(6):
             step = rm.transition(ctx)
             if not step.changed or not step.transition_key:
                 break
@@ -109,6 +139,40 @@ class TestCut:
             "rm_cut_mon_selected",
         ]
         assert rm.state == RewardMachineState.CUT_MON_SELECTED
+
+    def test_idle_to_success_same_step_cut_completed(self):
+        """한 스텝에 컷 완료만 남으면 IDLE→CUT_SUCCESS (DETECTED 스킵)."""
+        rm = RewardMachine()
+        s = _step(
+            rm,
+            0,
+            has_cut=True,
+            tile_in_front=0x00,
+            valid_cut_coords_count=1,
+            valid_cut_coords_delta=1,
+            used_cut_successfully=True,
+        )
+        assert rm.state == RewardMachineState.CUT_SUCCESS
+        assert s.transition_key == "rm_cut_success"
+
+    def test_idle_same_step_cut_chains_to_done(self):
+        rm = RewardMachine()
+        ctx = _ctx(
+            step_count=1,
+            has_cut=True,
+            tile_in_front=0x00,
+            valid_cut_coords_count=1,
+            valid_cut_coords_delta=1,
+            used_cut_successfully=True,
+        )
+        keys: list[str | None] = []
+        for _ in range(4):
+            step = rm.transition(ctx)
+            if not step.changed or not step.transition_key:
+                break
+            keys.append(step.transition_key)
+        assert keys == ["rm_cut_success", "rm_cut_done"]
+        assert rm.state == RewardMachineState.IDLE
 
     def test_shortcut_detected_to_success_when_tile_cleared(self):
         """스텝 끝 스냅샷이 메뉴 0·나무 제거면 DETECTED에서 곧바로 SUCCESS (증분 가드)."""
@@ -160,12 +224,20 @@ class TestCut:
         # 2사이클: rearmed → 전체 체인 완료
         _step(rm, 2, has_cut=True, tile_in_front=_CUT_TILE)
         assert rm.state == RewardMachineState.CUT_DETECTED
-        _step(rm, 3, has_cut=True, tile_in_front=_CUT_TILE, start_menu_open=True)
+        _step(rm, 3, has_cut=True, tile_in_front=_CUT_TILE, **_START_MENU)
         assert rm.state == RewardMachineState.CUT_MENU_OPEN
-        _step(rm, 4, has_cut=True, tile_in_front=_CUT_TILE, pokemon_menu_open=True)
+        _step(rm, 4, has_cut=True, tile_in_front=_CUT_TILE, **_PARTY_MENU)
+        assert rm.state == RewardMachineState.CUT_PARTY_MENU
+        _step(rm, 5, has_cut=True, tile_in_front=_CUT_TILE, **_FIELD_MENU)
         assert rm.state == RewardMachineState.CUT_MON_SELECTED
-        _step(rm, 5, has_cut=True, tile_in_front=0x00,
-              used_cut_successfully=True, valid_cut_coords_count=1)
+        _step(
+            rm,
+            6,
+            has_cut=True,
+            tile_in_front=0x00,
+            used_cut_successfully=True,
+            valid_cut_coords_count=1,
+        )
         assert rm.state == RewardMachineState.CUT_SUCCESS
 
     def test_no_immediate_reentry_from_detected(self):
@@ -176,7 +248,11 @@ class TestCut:
         # DETECTED를 abort하지 않고 유지 (메뉴도 안 열고)
         _step(rm, 1, has_cut=True, tile_in_front=_CUT_TILE)
         # CUT_DETECTED 유지 또는 MENU_OPEN 전이만 가능; 다시 IDLE→DETECTED 루프 없음
-        assert rm.state in {RewardMachineState.CUT_DETECTED, RewardMachineState.CUT_MENU_OPEN}
+        assert rm.state in {
+            RewardMachineState.CUT_DETECTED,
+            RewardMachineState.CUT_START_MENU,
+            RewardMachineState.CUT_MENU_OPEN,
+        }
 
     def test_cut_success_allows_reusing_same_coords(self):
         """같은 좌표에서 이미 컷 성공이 있어도, 다시 한 번 사용하면 SUCCESS를 허용한다."""
@@ -189,8 +265,8 @@ class TestCut:
             1,
             has_cut=True,
             tile_in_front=_CUT_TILE,
-            start_menu_open=True,
             valid_cut_coords_count=1,
+            **_START_MENU,
         )
         assert rm.state == RewardMachineState.CUT_MENU_OPEN
         _step(
@@ -198,15 +274,24 @@ class TestCut:
             2,
             has_cut=True,
             tile_in_front=_CUT_TILE,
-            pokemon_menu_open=True,
             valid_cut_coords_count=1,
+            **_PARTY_MENU,
+        )
+        assert rm.state == RewardMachineState.CUT_PARTY_MENU
+        _step(
+            rm,
+            3,
+            has_cut=True,
+            tile_in_front=_CUT_TILE,
+            valid_cut_coords_count=1,
+            **_FIELD_MENU,
         )
         assert rm.state == RewardMachineState.CUT_MON_SELECTED
 
         # valid_cut_coords_count 증분이 없어도 이번 사이클에서 컷 성공으로 간주.
         _step(
             rm,
-            3,
+            4,
             has_cut=True,
             tile_in_front=0x00,
             used_cut_successfully=True,
@@ -217,30 +302,32 @@ class TestCut:
     def test_failed_timeout(self):
         rm = RewardMachine()
         _step(rm, 0, has_cut=True, tile_in_front=_CUT_TILE)
-        _step(rm, 1, has_cut=True, tile_in_front=_CUT_TILE, start_menu_open=True)
-        assert rm.state == RewardMachineState.CUT_MENU_OPEN
+        _step(rm, 1, has_cut=True, tile_in_front=_CUT_TILE, **_START_MENU)
+        _step(rm, 2, has_cut=True, tile_in_front=_CUT_TILE, **_PARTY_MENU)
+        assert rm.state == RewardMachineState.CUT_PARTY_MENU
 
-        # 256 스텝 이상 → FAILED
-        s = _step(rm, 257, has_cut=True, tile_in_front=_CUT_TILE)
+        # 256 스텝 이상 → FAILED (PARTY_MENU 진입이 step 2이므로 +256)
+        s = _step(rm, 258, has_cut=True, tile_in_front=_CUT_TILE)
         assert rm.state == RewardMachineState.FAILED
         assert s.transition_key == "rm_failed_timeout"
 
     def test_failed_recovery(self):
         rm = RewardMachine()
         _step(rm, 0, has_cut=True, tile_in_front=_CUT_TILE)
-        _step(rm, 1, has_cut=True, tile_in_front=_CUT_TILE, start_menu_open=True)
-        _step(rm, 257)  # → FAILED
+        _step(rm, 1, has_cut=True, tile_in_front=_CUT_TILE, **_START_MENU)
+        _step(rm, 258)  # → FAILED
         assert rm.state == RewardMachineState.FAILED
 
         # 64 스텝 이상 대기 → IDLE 복구
-        _step(rm, 257 + 64 + 1)
+        _step(rm, 258 + 64 + 1)
         assert rm.state == RewardMachineState.IDLE
 
     def test_invalid_increase_triggers_failed(self):
         rm = RewardMachine()
         _step(rm, 0, has_cut=True, tile_in_front=_CUT_TILE)
-        _step(rm, 1, has_cut=True, tile_in_front=_CUT_TILE, start_menu_open=True)
-        assert rm.state == RewardMachineState.CUT_MENU_OPEN
+        _step(rm, 1, has_cut=True, tile_in_front=_CUT_TILE, **_START_MENU)
+        _step(rm, 2, has_cut=True, tile_in_front=_CUT_TILE, **_FIELD_MENU)
+        assert rm.state == RewardMachineState.CUT_MON_SELECTED
 
         # invalid_cut_coords가 8회 증가하면 FAILED
         for i in range(2, 2 + 8):
@@ -258,21 +345,48 @@ class TestSurf:
         _step(rm, 0, has_surf=True, tile_in_front=SURF_TILE_IN_FRONT)
         assert rm.state == RewardMachineState.SURF_DETECTED
 
-        _step(rm, 1, has_surf=True, tile_in_front=SURF_TILE_IN_FRONT, start_menu_open=True)
+        _step(rm, 1, has_surf=True, tile_in_front=SURF_TILE_IN_FRONT, **_START_MENU)
         assert rm.state == RewardMachineState.SURF_MENU_OPEN
 
-        _step(rm, 2, has_surf=True, tile_in_front=SURF_TILE_IN_FRONT, pokemon_menu_open=True)
+        _step(rm, 2, has_surf=True, tile_in_front=SURF_TILE_IN_FRONT, **_PARTY_MENU)
+        assert rm.state == RewardMachineState.SURF_PARTY_MENU
+
+        _step(rm, 3, has_surf=True, tile_in_front=SURF_TILE_IN_FRONT, **_FIELD_MENU)
         assert rm.state == RewardMachineState.SURF_MON_SELECTED
 
         # 서핑 시작(is_surfing=True) + valid_surf 증가
-        s = _step(rm, 3, has_surf=True, is_surfing=True,
-                  used_surf_successfully=True, valid_surf_coords_count=1)
+        s = _step(
+            rm,
+            4,
+            has_surf=True,
+            is_surfing=True,
+            used_surf_successfully=True,
+            valid_surf_coords_count=1,
+            surf_hook_success_count=1,
+        )
         assert rm.state == RewardMachineState.SURF_SUCCESS
         assert s.transition_key == "rm_surf_success"
 
-        s =         _step(rm, 4)
+        s = _step(rm, 5)
         assert rm.state == RewardMachineState.IDLE
         assert s.transition_key == "rm_surf_done"
+
+    def test_idle_to_success_same_step_surf_completed(self):
+        rm = RewardMachine()
+        s = _step(
+            rm,
+            0,
+            has_surf=True,
+            tile_in_front=0x00,
+            is_surfing=True,
+            valid_surf_coords_count=1,
+            valid_surf_coords_delta=1,
+            surf_hook_success_count=1,
+            surf_hook_success_delta=1,
+            used_surf_successfully=True,
+        )
+        assert rm.state == RewardMachineState.SURF_SUCCESS
+        assert s.transition_key == "rm_surf_success"
 
     def test_shortcut_detected_to_success_when_surfing(self):
         """앞 타일이 물이 아니어도 서핑 중이면 DETECTED에서 SUCCESS (valid 증분 가드)."""
@@ -287,6 +401,7 @@ class TestSurf:
             is_surfing=True,
             used_surf_successfully=True,
             valid_surf_coords_count=1,
+            surf_hook_success_count=1,
         )
         assert rm.state == RewardMachineState.SURF_SUCCESS
         assert s.transition_key == "rm_surf_success"
@@ -295,7 +410,54 @@ class TestSurf:
         rm = RewardMachine()
         _step(rm, 0, has_surf=True, tile_in_front=SURF_TILE_IN_FRONT)
         assert rm.state == RewardMachineState.SURF_DETECTED
-        s = _step(rm, 1, has_surf=True, tile_in_front=0x00)
+        s = _step(rm, 1, has_surf=True, tile_in_front=0x00, faces_adjacent_water=False)
+        assert rm.state == RewardMachineState.IDLE
+        assert s.transition_key == "rm_surf_aborted"
+
+    def test_no_detect_when_only_adjacent_water(self):
+        """옆 물만 있고 정면이 물이 아니면 SURF_DETECTED 하지 않음."""
+        rm = RewardMachine()
+        s = _step(
+            rm,
+            0,
+            has_surf=True,
+            tile_in_front=0x00,
+            faces_adjacent_water=True,
+        )
+        assert rm.state == RewardMachineState.IDLE
+        assert s.transition_key is None
+
+    def test_menu_open_progress_without_front_water_tile(self):
+        """메뉴가 열려 있으면 정면이 물이 아니어도 PARTY 전이 가능 (Cut과 다른 Surf 완화)."""
+        rm = RewardMachine()
+        _step(rm, 0, has_surf=True, tile_in_front=SURF_TILE_IN_FRONT)
+        _step(rm, 1, has_surf=True, tile_in_front=0x00, faces_adjacent_water=False, **_START_MENU)
+        s = _step(
+            rm,
+            2,
+            has_surf=True,
+            tile_in_front=0x00,
+            faces_adjacent_water=False,
+            **_PARTY_MENU,
+        )
+        assert rm.state == RewardMachineState.SURF_PARTY_MENU
+        assert s.transition_key == "rm_surf_party_menu"
+
+    def test_mon_selected_aborts_when_water_context_lost(self):
+        rm = RewardMachine()
+        _step(rm, 0, has_surf=True, tile_in_front=SURF_TILE_IN_FRONT)
+        _step(rm, 1, has_surf=True, tile_in_front=SURF_TILE_IN_FRONT, **_START_MENU)
+        _step(rm, 2, has_surf=True, tile_in_front=SURF_TILE_IN_FRONT, **_PARTY_MENU)
+        _step(rm, 3, has_surf=True, tile_in_front=SURF_TILE_IN_FRONT, **_FIELD_MENU)
+        assert rm.state == RewardMachineState.SURF_MON_SELECTED
+        s = _step(
+            rm,
+            4,
+            has_surf=True,
+            tile_in_front=0x00,
+            faces_adjacent_water=False,
+            is_surfing=False,
+        )
         assert rm.state == RewardMachineState.IDLE
         assert s.transition_key == "rm_surf_aborted"
 
@@ -304,25 +466,136 @@ class TestSurf:
         rm = RewardMachine()
         # surf 완료 → IDLE
         _step(rm, 0, has_surf=True, tile_in_front=SURF_TILE_IN_FRONT)
-        _step(rm, 1, has_surf=True, tile_in_front=SURF_TILE_IN_FRONT, start_menu_open=True)
-        _step(rm, 2, has_surf=True, tile_in_front=SURF_TILE_IN_FRONT, pokemon_menu_open=True)
-        _step(rm, 3, has_surf=True, is_surfing=True,
-              used_surf_successfully=True, valid_surf_coords_count=1)
-        _step(rm, 4)
+        _step(rm, 1, has_surf=True, tile_in_front=SURF_TILE_IN_FRONT, **_START_MENU)
+        _step(rm, 2, has_surf=True, tile_in_front=SURF_TILE_IN_FRONT, **_PARTY_MENU)
+        _step(rm, 3, has_surf=True, tile_in_front=SURF_TILE_IN_FRONT, **_FIELD_MENU)
+        _step(
+            rm,
+            4,
+            has_surf=True,
+            is_surfing=True,
+            used_surf_successfully=True,
+            valid_surf_coords_count=1,
+            surf_hook_success_count=1,
+            surf_hook_success_delta=1,
+        )
+        _step(rm, 5)
         assert rm.state == RewardMachineState.IDLE
         # 물 위에서 다시 시도 → 재진입 차단
-        _step(rm, 5, has_surf=True, tile_in_front=SURF_TILE_IN_FRONT, is_surfing=True)
+        _step(rm, 6, has_surf=True, tile_in_front=SURF_TILE_IN_FRONT, is_surfing=True)
         assert rm.state == RewardMachineState.IDLE
+
+    def test_menu_open_to_success_when_surfing_without_water_tile(self):
+        """메뉴 중 서핑 완료 시 앞 타일≠0x14여도 MENU_OPEN에서 SUCCESS."""
+        rm = RewardMachine()
+        _step(rm, 0, has_surf=True, tile_in_front=SURF_TILE_IN_FRONT)
+        _step(rm, 1, has_surf=True, tile_in_front=SURF_TILE_IN_FRONT, **_START_MENU)
+        assert rm.state == RewardMachineState.SURF_MENU_OPEN
+        s = _step(
+            rm,
+            2,
+            has_surf=True,
+            tile_in_front=0x00,
+            is_surfing=True,
+            used_surf_successfully=True,
+            valid_surf_coords_count=1,
+            valid_surf_coords_delta=1,
+            surf_hook_success_count=1,
+            surf_hook_success_delta=1,
+        )
+        assert rm.state == RewardMachineState.SURF_SUCCESS
+        assert s.transition_key == "rm_surf_success"
+
+    def test_party_menu_to_success_when_surfing_without_water_tile(self):
+        rm = RewardMachine()
+        _step(rm, 0, has_surf=True, tile_in_front=SURF_TILE_IN_FRONT)
+        _step(rm, 1, has_surf=True, tile_in_front=SURF_TILE_IN_FRONT, **_START_MENU)
+        _step(rm, 2, has_surf=True, tile_in_front=SURF_TILE_IN_FRONT, **_PARTY_MENU)
+        assert rm.state == RewardMachineState.SURF_PARTY_MENU
+        s = _step(
+            rm,
+            3,
+            has_surf=True,
+            tile_in_front=0x00,
+            is_surfing=True,
+            used_surf_successfully=True,
+            valid_surf_coords_count=1,
+            valid_surf_coords_delta=1,
+            surf_hook_success_count=1,
+            surf_hook_success_delta=1,
+        )
+        assert rm.state == RewardMachineState.SURF_SUCCESS
+        assert s.transition_key == "rm_surf_success"
+
+    def test_menu_open_success_requires_new_surf(self):
+        rm = RewardMachine()
+        _step(
+            rm,
+            0,
+            has_surf=True,
+            tile_in_front=SURF_TILE_IN_FRONT,
+            valid_surf_coords_count=1,
+            surf_hook_success_count=1,
+        )
+        _step(rm, 1, has_surf=True, tile_in_front=SURF_TILE_IN_FRONT, **_START_MENU)
+        assert rm.state == RewardMachineState.SURF_MENU_OPEN
+        _step(
+            rm,
+            2,
+            has_surf=True,
+            tile_in_front=0x00,
+            is_surfing=True,
+            used_surf_successfully=True,
+            valid_surf_coords_count=1,
+            surf_hook_success_count=1,
+        )
+        assert rm.state != RewardMachineState.SURF_SUCCESS
 
     def test_surf_success_requires_new_surf(self):
         rm = RewardMachine()
-        _step(rm, 0, has_surf=True, tile_in_front=SURF_TILE_IN_FRONT, valid_surf_coords_count=1)
-        _step(rm, 1, has_surf=True, tile_in_front=SURF_TILE_IN_FRONT, start_menu_open=True, valid_surf_coords_count=1)
-        _step(rm, 2, has_surf=True, tile_in_front=SURF_TILE_IN_FRONT, pokemon_menu_open=True, valid_surf_coords_count=1)
+        _step(
+            rm,
+            0,
+            has_surf=True,
+            tile_in_front=SURF_TILE_IN_FRONT,
+            valid_surf_coords_count=1,
+            surf_hook_success_count=1,
+        )
+        _step(
+            rm,
+            1,
+            has_surf=True,
+            tile_in_front=SURF_TILE_IN_FRONT,
+            valid_surf_coords_count=1,
+            **_START_MENU,
+        )
+        _step(
+            rm,
+            2,
+            has_surf=True,
+            tile_in_front=SURF_TILE_IN_FRONT,
+            valid_surf_coords_count=1,
+            **_PARTY_MENU,
+        )
+        _step(
+            rm,
+            3,
+            has_surf=True,
+            tile_in_front=SURF_TILE_IN_FRONT,
+            valid_surf_coords_count=1,
+            **_FIELD_MENU,
+        )
         assert rm.state == RewardMachineState.SURF_MON_SELECTED
-        # valid_surf_coords_count 증분 없음 → SUCCESS 불가
-        _step(rm, 3, has_surf=True, is_surfing=True,
-              used_surf_successfully=True, valid_surf_coords_count=1)
+        # surf_hook_success 증분 없음 → SUCCESS 불가
+        _step(
+            rm,
+            4,
+            has_surf=True,
+            is_surfing=True,
+            used_surf_successfully=True,
+            valid_surf_coords_count=1,
+            surf_hook_success_count=1,
+        )
         assert rm.state != RewardMachineState.SURF_SUCCESS
 
 
@@ -354,22 +627,29 @@ class TestFlash:
         assert rm.state == RewardMachineState.FLASH_DETECTED
 
         # FLASH_DETECTED → FLASH_MENU_OPEN
-        s = _step(rm, 1, has_flash=True, in_dark_cave=True, start_menu_open=True)
+        s = _step(rm, 1, has_flash=True, in_dark_cave=True, **_START_MENU)
         assert rm.state == RewardMachineState.FLASH_MENU_OPEN
         assert s.transition_key == "rm_flash_menu_open"
 
-        # FLASH_MENU_OPEN → FLASH_MON_SELECTED
-        s = _step(rm, 2, has_flash=True, in_dark_cave=True, pokemon_menu_open=True)
+        s = _step(rm, 2, has_flash=True, in_dark_cave=True, **_PARTY_MENU)
+        assert rm.state == RewardMachineState.FLASH_PARTY_MENU
+        assert s.transition_key == "rm_flash_party_menu"
+
+        s = _step(rm, 3, has_flash=True, in_dark_cave=True, **_FIELD_MENU)
         assert rm.state == RewardMachineState.FLASH_MON_SELECTED
         assert s.transition_key == "rm_flash_mon_selected"
 
         # Flash 사용: 동굴이 밝아지고 훅이 valid_flash_coords에 추가됨
-        s = _step(rm, 3, has_flash=True, in_dark_cave=False,
+        s = _step(
+            rm,
+            4,
+            has_flash=True,
+            in_dark_cave=False,
                   flash_cycle_has_new_success=True, valid_flash_coords_count=1)
         assert rm.state == RewardMachineState.FLASH_SUCCESS
         assert s.transition_key == "rm_flash_success"
 
-        s = _step(rm, 4)
+        s = _step(rm, 5)
         assert rm.state == RewardMachineState.IDLE
         assert s.transition_key == "rm_flash_done"
 
@@ -402,12 +682,18 @@ class TestFlash:
         """FLASH_MON_SELECTED에서 Flash 없이 동굴을 나가면 IDLE로 복귀."""
         rm = RewardMachine()
         _step(rm, 0, has_flash=True, in_dark_cave=True)
-        _step(rm, 1, has_flash=True, in_dark_cave=True, start_menu_open=True)
-        _step(rm, 2, has_flash=True, in_dark_cave=True, pokemon_menu_open=True)
+        _step(rm, 1, has_flash=True, in_dark_cave=True, **_START_MENU)
+        _step(rm, 2, has_flash=True, in_dark_cave=True, **_PARTY_MENU)
+        _step(rm, 3, has_flash=True, in_dark_cave=True, **_FIELD_MENU)
         assert rm.state == RewardMachineState.FLASH_MON_SELECTED
 
-        s = _step(rm, 3, has_flash=True, in_dark_cave=False,
-                  flash_cycle_has_new_success=False)
+        s = _step(
+            rm,
+            4,
+            has_flash=True,
+            in_dark_cave=False,
+            flash_cycle_has_new_success=False,
+        )
         assert rm.state == RewardMachineState.IDLE
         assert s.transition_key == "rm_flash_left_dark"
 
@@ -415,12 +701,13 @@ class TestFlash:
         """메뉴를 닫아도 동굴 안에 있으면 FLASH_MON_SELECTED 유지."""
         rm = RewardMachine()
         _step(rm, 0, has_flash=True, in_dark_cave=True)
-        _step(rm, 1, has_flash=True, in_dark_cave=True, start_menu_open=True)
-        _step(rm, 2, has_flash=True, in_dark_cave=True, pokemon_menu_open=True)
+        _step(rm, 1, has_flash=True, in_dark_cave=True, **_START_MENU)
+        _step(rm, 2, has_flash=True, in_dark_cave=True, **_PARTY_MENU)
+        _step(rm, 3, has_flash=True, in_dark_cave=True, **_FIELD_MENU)
         assert rm.state == RewardMachineState.FLASH_MON_SELECTED
 
         # 메뉴 닫힘, 아직 동굴 내부
-        _step(rm, 3, has_flash=True, in_dark_cave=True)
+        _step(rm, 4, has_flash=True, in_dark_cave=True)
         assert rm.state == RewardMachineState.FLASH_MON_SELECTED
 
     def test_idle_no_reentry_immediately_after_detected(self):
@@ -448,11 +735,12 @@ class TestFlash:
     def test_flash_failed_timeout(self):
         rm = RewardMachine()
         _step(rm, 0, has_flash=True, in_dark_cave=True)
-        _step(rm, 1, has_flash=True, in_dark_cave=True, start_menu_open=True)
-        assert rm.state == RewardMachineState.FLASH_MENU_OPEN
+        _step(rm, 1, has_flash=True, in_dark_cave=True, **_START_MENU)
+        _step(rm, 2, has_flash=True, in_dark_cave=True, **_PARTY_MENU)
+        assert rm.state == RewardMachineState.FLASH_PARTY_MENU
 
-        # 256 스텝 초과 → FAILED
-        s = _step(rm, 257, has_flash=True, in_dark_cave=True)
+        # 256 스텝 초과 → FAILED (PARTY_MENU 진입 step 2)
+        s = _step(rm, 258, has_flash=True, in_dark_cave=True)
         assert rm.state == RewardMachineState.FAILED
         assert s.transition_key == "rm_failed_timeout"
 
@@ -460,26 +748,33 @@ class TestFlash:
         """Flash 성공 후 다른 동굴에서 다시 FLASH_DETECTED로 진입 가능해야 함."""
         rm = RewardMachine()
         _step(rm, 0, has_flash=True, in_dark_cave=True)
-        _step(rm, 1, has_flash=True, in_dark_cave=True, start_menu_open=True)
-        _step(rm, 2, has_flash=True, in_dark_cave=True, pokemon_menu_open=True)
-        _step(rm, 3, has_flash=True, in_dark_cave=False,
-              flash_cycle_has_new_success=True, valid_flash_coords_count=1)
-        _step(rm, 4)  # FLASH_SUCCESS → IDLE
+        _step(rm, 1, has_flash=True, in_dark_cave=True, **_START_MENU)
+        _step(rm, 2, has_flash=True, in_dark_cave=True, **_PARTY_MENU)
+        _step(rm, 3, has_flash=True, in_dark_cave=True, **_FIELD_MENU)
+        _step(
+            rm,
+            4,
+            has_flash=True,
+            in_dark_cave=False,
+            flash_cycle_has_new_success=True,
+            valid_flash_coords_count=1,
+        )
+        _step(rm, 5)  # FLASH_SUCCESS → IDLE
         assert rm.state == RewardMachineState.IDLE
 
         # 동굴 밖 → idle_flash_entry_ok 재무장
-        _step(rm, 5, has_flash=True, in_dark_cave=False)
+        _step(rm, 6, has_flash=True, in_dark_cave=False)
         # 새 동굴 진입 → 재진입
-        _step(rm, 6, has_flash=True, in_dark_cave=True)
+        _step(rm, 7, has_flash=True, in_dark_cave=True)
         assert rm.state == RewardMachineState.FLASH_DETECTED
 
     def test_hm_target_is_flash_in_chain(self):
         rm = RewardMachine()
         _step(rm, 0, has_flash=True, in_dark_cave=True)
         assert rm.hm_target == HMTarget.FLASH
-        _step(rm, 1, has_flash=True, in_dark_cave=True, start_menu_open=True)
+        _step(rm, 1, has_flash=True, in_dark_cave=True, **_START_MENU)
         assert rm.hm_target == HMTarget.FLASH
-        _step(rm, 2, has_flash=True, in_dark_cave=True, pokemon_menu_open=True)
+        _step(rm, 2, has_flash=True, in_dark_cave=True, **_FIELD_MENU)
         assert rm.hm_target == HMTarget.FLASH
 
 

@@ -41,11 +41,48 @@ from pokemonred_puffer.data.moves import Moves
 from pokemonred_puffer.data.species import Species
 from pokemonred_puffer.global_map import GLOBAL_MAP_SHAPE
 from pokemonred_puffer.profile import Profile, Utilization
+from pokemonred_puffer.policies.multi_convolutional import HM_ACTIONS
 from pokemonred_puffer.rewards.reward_machine import HMTarget
 from pokemonred_puffer.wrappers.sqlite import SqliteStateResetWrapper
 
 pyximport.install(setup_args={"include_dirs": [np.get_include()]})
 from pokemonred_puffer.c_gae import compute_gae  # type: ignore  # noqa: E402
+
+
+def compute_gae_by_episode(
+    dones: np.ndarray,
+    values: np.ndarray,
+    rewards: np.ndarray,
+    gamma: float,
+    gae_lambda: float,
+) -> np.ndarray:
+    """GAE per episode segment (reset at ``done``) so sorted rollout batches do not leak across envs."""
+    dones = np.asarray(dones, dtype=np.float32)
+    values = np.asarray(values, dtype=np.float32)
+    rewards = np.asarray(rewards, dtype=np.float32)
+    advantages = np.zeros(len(rewards), dtype=np.float32)
+    start = 0
+    for i in range(len(rewards)):
+        if dones[i] > 0.0:
+            end = i + 1
+            if end > start:
+                advantages[start:end] = compute_gae(
+                    dones[start:end],
+                    values[start:end],
+                    rewards[start:end],
+                    gamma,
+                    gae_lambda,
+                )
+            start = end
+    if start < len(rewards):
+        advantages[start:] = compute_gae(
+            dones[start:],
+            values[start:],
+            rewards[start:],
+            gamma,
+            gae_lambda,
+        )
+    return advantages
 
 
 def torch_load_policy_checkpoint(path: str | pathlib.Path, *, map_location=None):
@@ -87,17 +124,37 @@ _CORE_STAT_KEYS = frozenset(
         "stats/rm_success_count",
         "stats/rm_cut_success_count",
         "stats/rm_surf_success_count",
+        "stats/rm_surf_success_per_detect",
         "stats/rm_flash_success_count",
         "stats/rm_intermediate_paid_count",
         "stats/rm_transition_reward",
-        "stats/rm_clawback_total",
-        "stats/rm_step_delta",
         "stats/rm_state",
         "stats/hm_target",
-        "stats/hm_supervision_target",
+        "stats/hm_aux_label",
     }
 )
 _CORE_STAT_PREFIXES = ("policy/", "reward/")
+
+
+_WANDB_LOSS_KEYS = frozenset(
+    {
+        "policy_loss",
+        "value_loss",
+        "hm_aux_loss",
+        "hm_accuracy",
+        "approx_kl",
+        "clipfrac",
+        "entropy_mean",
+    }
+)
+
+_WANDB_PERF_KEYS = frozenset(
+    {
+        "eval_time",
+        "env_time",
+        "train_time",
+    }
+)
 
 
 def _core_stats_only(stats: dict) -> dict:
@@ -290,7 +347,10 @@ class Losses:
     policy_loss: float = 0.0
     value_loss: float = 0.0
     hm_aux_loss: float = 0.0
+    # 4-class 전체 정확도 (NONE 포함). 대시보드 기본 지표.
     hm_accuracy: float = 0.0
+    # hm_target != NONE만 — 예전 1.0 과장 지표; 참고용.
+    hm_accuracy_active: float = 0.0
     hm_non_none_frac: float = 0.0
     # 배치 평균 HM softmax 엔트로피 (train.hm_head.entropy_bonus > 0 일 때만 의미 있음).
     hm_head_entropy: float = 0.0
@@ -301,6 +361,9 @@ class Losses:
     old_approx_kl: float = 0.0
     approx_kl: float = 0.0
     clipfrac: float = 0.0
+    # |ratio-1| 평균. clipfrac=0이어도 정책이 조금 움직이면 >0.
+    ratio_abs_mean: float = 0.0
+    adv_std: float = 0.0
     explained_variance: float = 0.0
 
 
@@ -400,6 +463,37 @@ class CleanPuffeRL:
             policy = self.uncompiled_policy if self.config.compile else self.policy
             lstm_h, lstm_c = self.experience.lstm_h, self.experience.lstm_c
 
+        # VecEnv recv() returns reward for the action from the previous send().
+        # Store (obs_t, action_t, reward_{t+1}) on the following recv, not (obs_t, action_t, reward_t).
+        pending_obs = None
+        pending_value = None
+        pending_actions = None
+        pending_logprob = None
+
+        def _record_infos(step_info):
+            for i in step_info:
+                for k, v in pufferlib.utils.unroll_nested_dict(i):
+                    if "state/" in k:
+                        _, key = k.split("/")
+                        key: tuple[str] = ast.literal_eval(key)
+                        self.states[key].append(v)
+                        if self.config.archive_states:
+                            state_dir = self.archive_path / str(hash(key))
+                            if not state_dir.exists():
+                                state_dir.mkdir(exist_ok=True)
+                                with open(state_dir / "desc.txt", "w") as f:
+                                    f.write(str(key))
+                            with open(state_dir / f"{hash(v)}.state", "wb") as f:
+                                f.write(v)
+                    elif "required_count" == k:
+                        for count, eid in zip(
+                            self.infos["required_count"], self.infos["env_id"]
+                        ):
+                            self.event_tracker[eid] = max(self.event_tracker.get(eid, 0), count)
+                        self.infos[k].append(v)
+                    else:
+                        self.infos[k].append(v)
+
         while not self.experience.full:
             with self.profile.env:
                 o, r, d, t, info, env_id, mask = self.vecenv.recv()
@@ -412,10 +506,22 @@ class CleanPuffeRL:
                 o_device = o.to(self.config.device)
                 r = torch.as_tensor(r)
                 d = torch.as_tensor(d)
+                mask_t = torch.as_tensor(mask)
+
+                if pending_obs is not None:
+                    self.experience.store(
+                        pending_obs,
+                        pending_value,
+                        pending_actions,
+                        pending_logprob,
+                        r,
+                        d,
+                        env_id,
+                        mask_t,
+                    )
+                    _record_infos(info)
 
             with self.profile.eval_forward, torch.no_grad():
-                # TODO: In place-update should be faster. Leaking 7% speed max
-                # Also should be using a cuda tensor to index
                 if lstm_h is not None:
                     h = lstm_h[:, env_id]
                     c = lstm_c[:, env_id]
@@ -430,39 +536,17 @@ class CleanPuffeRL:
 
             with self.profile.eval_misc:
                 value = value.flatten()
-                actions = actions.cpu().numpy()
-                mask = torch.as_tensor(mask)  # * policy.mask)
-                o = o if self.config.cpu_offload else o_device
+                actions_np = actions.cpu().numpy()
                 if self.config.num_envs == 1:
-                    actions = np.expand_dims(actions, 0)
+                    actions_np = np.expand_dims(actions_np, 0)
                     logprob = logprob.unsqueeze(0)
-                self.experience.store(o, value, actions, logprob, r, d, env_id, mask)
-
-                for i in info:
-                    for k, v in pufferlib.utils.unroll_nested_dict(i):
-                        if "state/" in k:
-                            _, key = k.split("/")
-                            key: tuple[str] = ast.literal_eval(key)
-                            self.states[key].append(v)
-                            if self.config.archive_states:
-                                state_dir = self.archive_path / str(hash(key))
-                                if not state_dir.exists():
-                                    state_dir.mkdir(exist_ok=True)
-                                    with open(state_dir / "desc.txt", "w") as f:
-                                        f.write(str(key))
-                                with open(state_dir / f"{hash(v)}.state", "wb") as f:
-                                    f.write(v)
-                        elif "required_count" == k:
-                            for count, eid in zip(
-                                self.infos["required_count"], self.infos["env_id"]
-                            ):
-                                self.event_tracker[eid] = max(self.event_tracker.get(eid, 0), count)
-                            self.infos[k].append(v)
-                        else:
-                            self.infos[k].append(v)
+                pending_obs = o if self.config.cpu_offload else o_device
+                pending_value = value
+                pending_actions = actions_np
+                pending_logprob = logprob
 
             with self.profile.env:
-                self.vecenv.send(actions)
+                self.vecenv.send(actions_np)
 
         with self.profile.eval_misc:
             # TODO: use the event infos instead of the states.
@@ -687,19 +771,27 @@ class CleanPuffeRL:
                 self.stats["policy/hm_feature_alpha"] = hm_feature_alpha.detach().item()
             if hm_action_beta is not None:
                 self.stats["policy/hm_action_beta"] = hm_action_beta.detach().item()
+            hm_menu_action_beta = get_policy_attr(self.policy, "hm_menu_action_beta")
+            if hm_menu_action_beta is not None:
+                self.stats["policy/hm_menu_action_beta"] = hm_menu_action_beta.detach().item()
             if hm_probs is not None:
                 hm_probs_float = hm_probs.detach().float()
                 mean_hm_probs = hm_probs_float.mean(dim=0).cpu().numpy()
                 for idx, value in enumerate(mean_hm_probs):
-                    self.stats[f"policy/hm_prob_{idx}"] = value
+                    name = HM_ACTIONS[idx] if idx < len(HM_ACTIONS) else str(idx)
+                    self.stats[f"policy/hm_prob_{name}"] = value
                 if hm_target is not None:
                     hm_target_flat = hm_target.detach().reshape(-1).long()
                     hm_mask = hm_target_flat != int(HMTarget.NONE)
-                    self.stats["policy/hm_supervision_non_none_frac"] = hm_mask.float().mean().item()
-                    if hm_mask.any():
-                        mean_active_hm_probs = hm_probs_float[hm_mask].mean(dim=0).cpu().numpy()
-                        for idx, value in enumerate(mean_active_hm_probs):
-                            self.stats[f"policy/hm_prob_active_{idx}"] = value
+                    self.stats["policy/hm_aux_non_none_frac"] = hm_mask.float().mean().item()
+
+            surf_detect_key = "stats/rm_surf_detected_count"
+            surf_success_key = "stats/rm_surf_success_count"
+            if surf_detect_key in self.stats and surf_success_key in self.stats:
+                detected = float(self.stats[surf_detect_key])
+                success = float(self.stats[surf_success_key])
+                if detected > 1e-9:
+                    self.stats["stats/rm_surf_success_per_detect"] = success / detected
 
             # Drop noisy environment internals from terminal dashboard and W&B payload.
             self.stats = _core_stats_only(self.stats)
@@ -729,8 +821,7 @@ class CleanPuffeRL:
             dones_np = self.experience.dones_np[idxs]
             values_np = self.experience.values_np[idxs]
             rewards_np = self.experience.rewards_np[idxs]
-            # TODO: bootstrap between segment bounds
-            advantages_np = compute_gae(
+            advantages_np = compute_gae_by_episode(
                 dones_np, values_np, rewards_np, self.config.gamma, self.config.gae_lambda
             )
             self.experience.flatten_batch(advantages_np)
@@ -774,9 +865,15 @@ class CleanPuffeRL:
                         # calculate approx_kl http://joschu.net/blog/kl-approx.html
                         old_approx_kl = (-logratio).mean()
                         approx_kl = ((ratio - 1) - logratio).mean()
-                        clipfrac = ((ratio - 1.0).abs() > self.config.clip_coef).float().mean()
+                        ratio_abs = (ratio - 1.0).abs()
+                        clipfrac = (ratio_abs > self.config.clip_coef).float().mean()
+                        ratio_abs_mean = ratio_abs.mean()
 
                     adv = adv.reshape(-1)
+                    adv_std = adv.std()
+                    adv_scale = float(getattr(self.config, "adv_scale", 1.0))
+                    if adv_scale != 1.0:
+                        adv = adv * adv_scale
                     if self.config.norm_adv:
                         adv = (adv - adv.mean()) / (adv.std() + 1e-8)
 
@@ -805,12 +902,13 @@ class CleanPuffeRL:
                     entropy_loss = entropy.mean()
                     hm_aux_loss = torch.zeros((), device=self.config.device)
                     hm_accuracy = torch.zeros((), device=self.config.device)
+                    hm_accuracy_active = torch.zeros((), device=self.config.device)
                     hm_non_none_frac = torch.zeros((), device=self.config.device)
                     hm_head_H = torch.zeros((), device=self.config.device)
                     # NOTE: `obs` here is the flat uint8 tensor from the rollout
                     # buffer, not a dict. The policy's `encode_observations`
                     # nativizes it internally and stashes both `last_hm_logits`
-                    # and `last_hm_target` (from obs `hm_supervision_target`) for aux CE.
+                    # and `last_hm_target` (from obs `hm_aux_label`, 액션 직전 래치) for aux CE.
                     hm_logits = get_policy_attr(self.policy, "last_hm_logits")
                     hm_target = get_policy_attr(self.policy, "last_hm_target")
                     if (
@@ -820,21 +918,19 @@ class CleanPuffeRL:
                     ):
                         hm_logits_flat = hm_logits.reshape(-1, hm_logits.shape[-1])
                         hm_target_flat = hm_target.reshape(-1).long()
-                        # 비-NONE: RM이 말하는 HM(cut/surf/…) 맞추기.
+                        hm_preds = hm_logits_flat.argmax(dim=-1)
                         hm_mask = hm_target_flat != int(HMTarget.NONE)
+                        hm_accuracy = (hm_preds == hm_target_flat).float().mean()
                         if hm_mask.any():
-                            masked_logits = hm_logits_flat[hm_mask]
-                            masked_target = hm_target_flat[hm_mask]
-                            ls = hm_aux_label_smoothing
                             hm_aux_loss = F.cross_entropy(
-                                masked_logits, masked_target, label_smoothing=ls
+                                hm_logits_flat[hm_mask],
+                                hm_target_flat[hm_mask],
+                                label_smoothing=hm_aux_label_smoothing,
                             )
-                            hm_accuracy = (
-                                masked_logits.argmax(dim=-1) == masked_target
+                            hm_accuracy_active = (
+                                hm_preds[hm_mask] == hm_target_flat[hm_mask]
                             ).float().mean()
                         hm_non_none_frac = hm_mask.float().mean()
-                        # NONE을 완전히 빼면 대부분 IDLE인데도 HM softmax가 CUT(0)으로만 붕괴함.
-                        # IDLE 샘플에 대해 클래스 NONE을 맞추는 CE를 약하게 더함 (계수로 PPO와 균형).
                         none_mask = hm_target_flat == int(HMTarget.NONE)
                         if hm_none_ce_coef > 0.0 and none_mask.any():
                             hm_aux_loss = hm_aux_loss + hm_none_ce_coef * F.cross_entropy(
@@ -871,12 +967,17 @@ class CleanPuffeRL:
                     losses.value_loss += v_loss.item() / self.experience.num_minibatches
                     losses.hm_aux_loss += hm_aux_loss.item() / self.experience.num_minibatches
                     losses.hm_accuracy += hm_accuracy.item() / self.experience.num_minibatches
+                    losses.hm_accuracy_active += (
+                        hm_accuracy_active.item() / self.experience.num_minibatches
+                    )
                     losses.hm_non_none_frac += hm_non_none_frac.item() / self.experience.num_minibatches
                     losses.hm_head_entropy += hm_head_H.item() / self.experience.num_minibatches
                     losses.entropy += entropy_loss.item() / self.experience.num_minibatches
                     losses.old_approx_kl += old_approx_kl.item() / self.experience.num_minibatches
                     losses.approx_kl += approx_kl.item() / self.experience.num_minibatches
                     losses.clipfrac += clipfrac.item() / self.experience.num_minibatches
+                    losses.ratio_abs_mean += ratio_abs_mean.item() / self.experience.num_minibatches
+                    losses.adv_std += adv_std.item() / self.experience.num_minibatches
             ppo_epochs_done += 1
 
             if self.config.target_kl is not None:
@@ -892,11 +993,14 @@ class CleanPuffeRL:
             losses.value_loss *= inv
             losses.hm_aux_loss *= inv
             losses.hm_accuracy *= inv
+            losses.hm_accuracy_active *= inv
             losses.hm_non_none_frac *= inv
             losses.hm_head_entropy *= inv
             losses.old_approx_kl *= inv
             losses.approx_kl *= inv
             losses.clipfrac *= inv
+            losses.ratio_abs_mean *= inv
+            losses.adv_std *= inv
 
         with self.profile.train_misc:
             if self.config.anneal_lr:
@@ -937,8 +1041,16 @@ class CleanPuffeRL:
                             "Overview/agent_steps": self.global_step,
                             "Overview/learning_rate": self.optimizer.param_groups[0]["lr"],
                             **_wandb_environment_metrics(self.stats),
-                            **{f"losses/{k}": v for k, v in self.losses.__dict__.items()},
-                            **{f"performance/{k}": v for k, v in self.profile},
+                            **{
+                                f"losses/{k}": v
+                                for k, v in self.losses.__dict__.items()
+                                if k in _WANDB_LOSS_KEYS
+                            },
+                            **{
+                                f"performance/{k}": v
+                                for k, v in self.profile
+                                if k in _WANDB_PERF_KEYS
+                            },
                         },
                     )
 
